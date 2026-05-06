@@ -382,6 +382,66 @@ def merge_microstructure(feats: pd.DataFrame, micro: pd.DataFrame, prefix: str):
     return pd.concat([feats, micro], axis=1), n_rows
 
 
+def compute_sl_points(signal_series: pd.Series, bars: pd.DataFrame,
+                      atr14: pd.Series, sl_mult: float, max_bars: int) -> pd.Series:
+    """
+    Computes a single average SL distance from all historical transitions:
+      - Collects MAE for every buy transition (0→1): close - min(low) until next sell or max_bars
+      - Collects MAE for every sell transition (1→0): max(high) - close until next buy or max_bars
+      - avg_buy_sl  = mean of all buy  MAEs  (floor: ATR14 × sl_mult)
+      - avg_sell_sl = mean of all sell MAEs  (floor: ATR14 × sl_mult)
+    Every transition bar in the output receives the appropriate average value.
+    Non-transition bars receive 0 (not displayed on chart).
+    """
+    idx     = signal_series.index
+    closes  = bars['Close'].reindex(idx).values
+    lows    = bars['Low'].reindex(idx).values
+    highs   = bars['High'].reindex(idx).values
+    atr     = atr14.reindex(idx).values
+    sig     = signal_series.values
+    n       = len(sig)
+
+    atr_sl_default = np.nanmedian(atr[~np.isnan(atr)]) * sl_mult if np.any(~np.isnan(atr)) else 0.0
+
+    buy_maes  = []
+    sell_maes = []
+    trans     = []   # (i, 'buy'|'sell')
+
+    for i in range(1, n):
+        prev, curr = int(sig[i - 1]), int(sig[i])
+
+        if curr == 1 and prev == 0:
+            end = n
+            for j in range(i + 1, min(i + 1 + max_bars, n)):
+                if int(sig[j]) == 0:
+                    end = j
+                    break
+            mae = closes[i] - np.nanmin(lows[i:end])
+            buy_maes.append(max(mae, 0.0))
+            trans.append((i, 'buy'))
+
+        elif curr == 0 and prev == 1:
+            end = n
+            for j in range(i + 1, min(i + 1 + max_bars, n)):
+                if int(sig[j]) == 1:
+                    end = j
+                    break
+            mae = np.nanmax(highs[i:end]) - closes[i]
+            sell_maes.append(max(mae, 0.0))
+            trans.append((i, 'sell'))
+
+    avg_buy_sl  = max(float(np.mean(buy_maes))  if buy_maes  else atr_sl_default, atr_sl_default)
+    avg_sell_sl = max(float(np.mean(sell_maes)) if sell_maes else atr_sl_default, atr_sl_default)
+    print(f"  SL estimate — buy avg={avg_buy_sl:.0f}p (n={len(buy_maes)})  "
+          f"sell avg={avg_sell_sl:.0f}p (n={len(sell_maes)})")
+
+    sl = np.zeros(n, dtype=float)
+    for i, kind in trans:
+        sl[i] = avg_buy_sl if kind == 'buy' else avg_sell_sl
+
+    return pd.Series(np.round(sl, 0).astype(int), index=idx, name='SL_Points')
+
+
 # ── Per-target processing ─────────────────────────────────────────────────────
 def process_target(target: dict) -> str:
     symbol  = target['symbol']
@@ -433,9 +493,23 @@ def process_target(target: dict) -> str:
     print(f"[{symbol}] proba stats: min={proba.min():.3f} max={proba.max():.3f} mean={proba.mean():.3f} pct>threshold={( proba > PROB_THRESHOLD).mean():.1%}")
     signal = (proba > PROB_THRESHOLD).astype(int)
 
+    sig_series = pd.Series(signal, index=X.index)
+    sl_pts     = compute_sl_points(sig_series, bars, atr14, TB_SL_MULT, TB_MAX_BARS)
+
+    # Extract average SL values for reuse on tail bars (no future data available there)
+    buy_sl_avg  = int(sl_pts[sl_pts > 0].max()) if (sl_pts > 0).any() else 0
+    # Derive per-direction averages from the series itself
+    _buy_vals  = [sl_pts.iloc[i] for i in range(1, len(sig_series))
+                  if sig_series.iloc[i] == 1 and sig_series.iloc[i-1] == 0 and sl_pts.iloc[i] > 0]
+    _sell_vals = [sl_pts.iloc[i] for i in range(1, len(sig_series))
+                  if sig_series.iloc[i] == 0 and sig_series.iloc[i-1] == 1 and sl_pts.iloc[i] > 0]
+    avg_buy_sl_val  = int(round(np.mean(_buy_vals)))  if _buy_vals  else buy_sl_avg
+    avg_sell_sl_val = int(round(np.mean(_sell_vals))) if _sell_vals else buy_sl_avg
+
     new_df = pd.DataFrame({
         'Timestamp': X.index.astype('int64') // 10**9,
         'ML_Signal': signal,
+        'SL_Points': sl_pts.values,
     })
 
     # Score the unlabeled tail (last TB_MAX_BARS bars that lacked future bars
@@ -445,9 +519,23 @@ def process_target(target: dict) -> str:
     if len(tail_feats) > 0:
         tail_proba  = model.predict_proba(tail_feats)[:, 1]
         tail_signal = (tail_proba > PROB_THRESHOLD).astype(int)
+        tail_atr = atr14.reindex(tail_feats.index).values
+        # Use the historically-derived average SL for tail transition bars
+        prev_sig = int(signal[-1]) if len(signal) > 0 else 0
+        tail_sl = []
+        for k, ts in enumerate(tail_signal):
+            curr_sig = int(ts)
+            if curr_sig == 1 and prev_sig == 0:
+                tail_sl.append(avg_buy_sl_val)
+            elif curr_sig == 0 and prev_sig == 1:
+                tail_sl.append(avg_sell_sl_val)
+            else:
+                tail_sl.append(0)
+            prev_sig = curr_sig
         tail_df = pd.DataFrame({
             'Timestamp': tail_feats.index.astype('int64') // 10**9,
             'ML_Signal': tail_signal,
+            'SL_Points': tail_sl,
         })
         new_df = pd.concat([new_df, tail_df], ignore_index=True)
         print(f"[{symbol}] tail bars scored: {len(tail_df)}  buys={int(tail_signal.sum())}")
@@ -467,6 +555,9 @@ def process_target(target: dict) -> str:
     if FREEZE_HISTORY and os.path.exists(csv_path):
         try:
             old_df = pd.read_csv(csv_path)
+            # Ensure legacy CSVs without SL_Points don't corrupt column alignment
+            if 'SL_Points' not in old_df.columns:
+                old_df['SL_Points'] = 0
             # Lock in every closed bar from the previous CSV. Only the LAST
             # row of the old CSV is considered the (then-)forming bar and gets
             # overwritten by the fresh prediction.
@@ -477,6 +568,7 @@ def process_target(target: dict) -> str:
                 merged = pd.concat([frozen, new_df], ignore_index=True)
                 merged = merged.drop_duplicates(subset='Timestamp', keep='last')
                 merged = merged.sort_values('Timestamp')
+                merged['SL_Points'] = merged['SL_Points'].fillna(0).astype(int)
                 n_frozen = len(frozen)
                 merged.to_csv(csv_path, index=False)
             else:
