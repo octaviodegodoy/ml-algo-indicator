@@ -385,61 +385,27 @@ def merge_microstructure(feats: pd.DataFrame, micro: pd.DataFrame, prefix: str):
 def compute_sl_points(signal_series: pd.Series, bars: pd.DataFrame,
                       atr14: pd.Series, sl_mult: float, max_bars: int) -> pd.Series:
     """
-    Computes a single average SL distance from all historical transitions:
-      - Collects MAE for every buy transition (0→1): close - min(low) until next sell or max_bars
-      - Collects MAE for every sell transition (1→0): max(high) - close until next buy or max_bars
-      - avg_buy_sl  = mean of all buy  MAEs  (floor: ATR14 × sl_mult)
-      - avg_sell_sl = mean of all sell MAEs  (floor: ATR14 × sl_mult)
-    Every transition bar in the output receives the appropriate average value.
+    Computes a fixed SL distance using the median ATR(14) over the entire training
+    lookback (all N_BARS), scaled by sl_mult.  This is stable across runs because it
+    uses thousands of bars rather than the small number of signal transitions.
+    Every transition bar (buy or sell) receives the same fixed value.
     Non-transition bars receive 0 (not displayed on chart).
     """
-    idx     = signal_series.index
-    closes  = bars['Close'].reindex(idx).values
-    lows    = bars['Low'].reindex(idx).values
-    highs   = bars['High'].reindex(idx).values
-    atr     = atr14.reindex(idx).values
-    sig     = signal_series.values
-    n       = len(sig)
+    # Full-history median ATR — one stable number for the whole session
+    atr_full = atr14.reindex(signal_series.index).values
+    fixed_sl = float(np.nanmedian(atr_full) * sl_mult) if np.any(~np.isnan(atr_full)) else 0.0
+    print(f"  SL (fixed median-ATR×{sl_mult}) = {fixed_sl:.0f}p  "
+          f"(computed over {np.sum(~np.isnan(atr_full))} bars)")
 
-    atr_sl_default = np.nanmedian(atr[~np.isnan(atr)]) * sl_mult if np.any(~np.isnan(atr)) else 0.0
-
-    buy_maes  = []
-    sell_maes = []
-    trans     = []   # (i, 'buy'|'sell')
-
+    sig = signal_series.values
+    n   = len(sig)
+    sl  = np.zeros(n, dtype=float)
     for i in range(1, n):
         prev, curr = int(sig[i - 1]), int(sig[i])
+        if (curr == 1 and prev == 0) or (curr == 0 and prev == 1):
+            sl[i] = fixed_sl
 
-        if curr == 1 and prev == 0:
-            end = n
-            for j in range(i + 1, min(i + 1 + max_bars, n)):
-                if int(sig[j]) == 0:
-                    end = j
-                    break
-            mae = closes[i] - np.nanmin(lows[i:end])
-            buy_maes.append(max(mae, 0.0))
-            trans.append((i, 'buy'))
-
-        elif curr == 0 and prev == 1:
-            end = n
-            for j in range(i + 1, min(i + 1 + max_bars, n)):
-                if int(sig[j]) == 1:
-                    end = j
-                    break
-            mae = np.nanmax(highs[i:end]) - closes[i]
-            sell_maes.append(max(mae, 0.0))
-            trans.append((i, 'sell'))
-
-    avg_buy_sl  = max(float(np.mean(buy_maes))  if buy_maes  else atr_sl_default, atr_sl_default)
-    avg_sell_sl = max(float(np.mean(sell_maes)) if sell_maes else atr_sl_default, atr_sl_default)
-    print(f"  SL estimate — buy avg={avg_buy_sl:.0f}p (n={len(buy_maes)})  "
-          f"sell avg={avg_sell_sl:.0f}p (n={len(sell_maes)})")
-
-    sl = np.zeros(n, dtype=float)
-    for i, kind in trans:
-        sl[i] = avg_buy_sl if kind == 'buy' else avg_sell_sl
-
-    return pd.Series(np.round(sl, 0).astype(int), index=idx, name='SL_Points')
+    return pd.Series(np.round(sl, 0).astype(int), index=signal_series.index, name='SL_Points')
 
 
 # ── Per-target processing ─────────────────────────────────────────────────────
@@ -496,15 +462,9 @@ def process_target(target: dict) -> str:
     sig_series = pd.Series(signal, index=X.index)
     sl_pts     = compute_sl_points(sig_series, bars, atr14, TB_SL_MULT, TB_MAX_BARS)
 
-    # Extract average SL values for reuse on tail bars (no future data available there)
-    buy_sl_avg  = int(sl_pts[sl_pts > 0].max()) if (sl_pts > 0).any() else 0
-    # Derive per-direction averages from the series itself
-    _buy_vals  = [sl_pts.iloc[i] for i in range(1, len(sig_series))
-                  if sig_series.iloc[i] == 1 and sig_series.iloc[i-1] == 0 and sl_pts.iloc[i] > 0]
-    _sell_vals = [sl_pts.iloc[i] for i in range(1, len(sig_series))
-                  if sig_series.iloc[i] == 0 and sig_series.iloc[i-1] == 1 and sl_pts.iloc[i] > 0]
-    avg_buy_sl_val  = int(round(np.mean(_buy_vals)))  if _buy_vals  else buy_sl_avg
-    avg_sell_sl_val = int(round(np.mean(_sell_vals))) if _sell_vals else buy_sl_avg
+    # Fixed SL value — same for every transition (read from first non-zero entry)
+    _nonzero = sl_pts[sl_pts > 0]
+    avg_sl_val = int(_nonzero.iloc[0]) if len(_nonzero) > 0 else 0
 
     new_df = pd.DataFrame({
         'Timestamp': X.index.astype('int64') // 10**9,
@@ -519,16 +479,13 @@ def process_target(target: dict) -> str:
     if len(tail_feats) > 0:
         tail_proba  = model.predict_proba(tail_feats)[:, 1]
         tail_signal = (tail_proba > PROB_THRESHOLD).astype(int)
-        tail_atr = atr14.reindex(tail_feats.index).values
-        # Use the historically-derived average SL for tail transition bars
+        # Use the same fixed SL value for tail transition bars
         prev_sig = int(signal[-1]) if len(signal) > 0 else 0
         tail_sl = []
         for k, ts in enumerate(tail_signal):
             curr_sig = int(ts)
-            if curr_sig == 1 and prev_sig == 0:
-                tail_sl.append(avg_buy_sl_val)
-            elif curr_sig == 0 and prev_sig == 1:
-                tail_sl.append(avg_sell_sl_val)
+            if (curr_sig == 1 and prev_sig == 0) or (curr_sig == 0 and prev_sig == 1):
+                tail_sl.append(avg_sl_val)
             else:
                 tail_sl.append(0)
             prev_sig = curr_sig
