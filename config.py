@@ -21,13 +21,13 @@ N_BARS            = 5000
 # ── Triple-barrier params (in ATR multiples) ──────────────────────────────────
 TB_MAX_BARS       = 12           # vertical barrier: ~1 hour on M5
 TB_PT_MULT        = 1.5          # profit target = 1.5 × ATR(14)
-TB_SL_MULT        = 1.0          # stop loss    = 1.0 × ATR(14)
+TB_SL_MULT        = 1.2          # stop loss    = 1.2 × ATR(14)  (widened to survive noise)
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-PROB_THRESHOLD    = 0.50
+PROB_THRESHOLD    = 0.54         # raised from 0.50; 0.57 was too strict for balanced-class LightGBM
 INTERVAL_SECONDS  = 60
 N_SPLITS_CV       = 5
-RECENCY_DECAY     = 2.0          # exponential recency weighting: newest bars ~7x heavier than oldest
+RECENCY_DECAY     = 1.2          # lowered from 2.0 — reduces oversensitivity to single volatile bars
 
 # ── Microstructure ────────────────────────────────────────────────────────────
 DOM_LEVELS        = 5            # top-N book levels to aggregate
@@ -44,18 +44,19 @@ FREEZE_HISTORY    = True
 TRADE_ENABLED      = True   # set True to allow real orders
 TRADE_BOTH_SIDES   = True   # True  = signal 1 → long, signal 0 → short
                               # False = signal 1 → long, signal 0 → close long only
-RISK_PCT           = 0.05   # % of account balance risked per trade
+RISK_PCT           = 2.0   # % of account balance risked per trade
 MAX_SLIPPAGE       = 10     # maximum allowed slippage in points
 MAGIC_NUMBER       = 20260507  # unique tag for orders placed by this script
-TRAIL_ACTIVATE_PCT = 0.40   # activate trailing stop when profit >= 40% of SL distance
+TRAIL_ACTIVATE_PCT = 0.50   # activate trailing stop when profit >= 50% of SL distance
 
 # ── Grid (Fibonacci martingale) ───────────────────────────────────────────────
 GRID_ENABLED           = True   # add Fibonacci-scaled orders when a position is in loss
 GRID_MAX_LEVELS        = 5      # maximum grid add-ons per seed position
-GRID_STEP_MULT         = 0.30   # grid step = GRID_STEP_MULT × SL-distance in adverse direction
-                                 # e.g. 0.10 → first add-on at price_open − 0.10×SL_dist (long)
-GRID_PORTFOLIO_SL_MULT = 5.00    # close entire grid when total floating loss exceeds
+GRID_STEP_MULT         = 0.80   # grid step = GRID_STEP_MULT × SL-distance in adverse direction
+                                 # raised from 0.30 — less aggressive averaging-down
+GRID_PORTFOLIO_SL_MULT = 2.50   # close entire grid when total floating loss exceeds
                                  # this multiple of (seed_sl_dist × point_value × seed_lot)
+                                 # lowered from 5.00 — tighter total grid exposure cap
 
 # ── Output paths ──────────────────────────────────────────────────────────────
 _files_dir = os.path.normpath(

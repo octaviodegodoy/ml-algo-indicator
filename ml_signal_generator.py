@@ -16,6 +16,7 @@
 
 import os
 import time
+from collections import deque
 from typing import Optional
 
 import numpy as np
@@ -42,7 +43,11 @@ from model import (
     triple_barrier_labels, compute_recency_weights,
     evaluate_walkforward, compute_sl_points,
 )
-from trade import execute_trade, manage_trailing_stops, manage_grid_orders
+from trade import execute_trade, manage_trailing_stops, manage_grid_orders, init_signal_state
+
+
+# ── Signal persistence buffer (per symbol, last 2 evaluations) ───────────────
+_signal_buffer: dict = {}   # symbol → deque(maxlen=2)
 
 
 # ── Per-target processing ─────────────────────────────────────────────────────
@@ -105,8 +110,9 @@ def process_target(target: dict) -> str:
     sig_series = pd.Series(signal, index=X.index)
     sl_pts     = compute_sl_points(sig_series, bars, atr14, TB_SL_MULT, TB_MAX_BARS)
 
-    _nonzero   = sl_pts[sl_pts > 0]
-    avg_sl_val = int(_nonzero.iloc[0]) if len(_nonzero) > 0 else 0
+    # Use current-bar ATR for SL sizing (avoids stale historical median on volatile days)
+    _atr_last  = float(atr14.iloc[-1]) if not np.isnan(float(atr14.iloc[-1])) else float(np.nanmedian(atr14.values))
+    avg_sl_val = int(round(_atr_last * TB_SL_MULT)) if _atr_last > 0 else 0
 
     new_df = pd.DataFrame({
         "Timestamp": X.index.astype("int64") // 10**9,
@@ -171,9 +177,23 @@ def process_target(target: dict) -> str:
     else:
         new_df.to_csv(csv_path, index=False)
 
-    # 9. Execute trade on latest signal
+    # 9. Execute trade on latest signal (quality gate + 2-bar persistence filter)
     latest_signal = int(new_df.sort_values("Timestamp").iloc[-1]["ML_Signal"])
-    execute_trade(symbol, latest_signal, avg_sl_val)
+    _edge = metrics['precision'] - metrics['baseline_rate']
+    _pct_buy = float((proba > PROB_THRESHOLD).mean())
+    print(f"[{symbol}] prob dist: pct>threshold={_pct_buy:.1%}  "
+          f"latest_signal={latest_signal}  edge={_edge:+.3f}  prec={metrics['precision']:.3f}")
+    # Quality gate: precision floor is 0.505 (barely above random); edge check is the main guard
+    if metrics['precision'] < 0.505 or _edge < 0.02:
+        print(f"[{symbol}] low-edge model (prec={metrics['precision']:.3f} edge={_edge:+.3f}) — skipping trade")
+    else:
+        buf = _signal_buffer.setdefault(symbol, deque(maxlen=2))
+        buf.append(latest_signal)
+        print(f"[{symbol}] persistence buffer: {list(buf)}")
+        if len(buf) >= 2 and len(set(buf)) == 1:
+            execute_trade(symbol, latest_signal, avg_sl_val)
+        else:
+            print(f"[{symbol}] signal not yet confirmed ({list(buf)}) — holding")
 
     extras     = []
     if n_dom_used  >= MIN_MICRO_ROWS: extras.append(f"+dom({n_dom_used})")
@@ -215,6 +235,7 @@ def _latest_bar_time(symbol: str) -> Optional[int]:
 
 if __name__ == "__main__":
     mt5_setup()
+    init_signal_state()
     print("Multi-symbol ML signal generator started")
     print(f"Microstructure features need >={MIN_MICRO_ROWS} bars of collected data before activation.")
 

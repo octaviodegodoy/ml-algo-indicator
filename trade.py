@@ -18,6 +18,28 @@ _FIB: list = [1, 1, 2, 3, 5, 8, 13, 21]  # Fibonacci multipliers per grid level
 _grid_state: dict = {}                # ticket → set of grid levels already placed
 
 
+# ── Startup: restore signal state from open positions ─────────────────────────
+def init_signal_state() -> None:
+    """
+    On script startup, infer _last_exec_signal from any already-open MT5
+    positions so the first bar after a restart doesn't double-enter or
+    prematurely reverse an existing trade.
+    """
+    for t in TARGETS:
+        symbol    = t['symbol']
+        positions = mt5.positions_get(symbol=symbol)
+        if not positions:
+            continue
+        for pos in positions:
+            if pos.magic != MAGIC_NUMBER:
+                continue
+            inferred = 1 if pos.type == mt5.ORDER_TYPE_BUY else 0
+            _last_exec_signal[symbol] = inferred
+            side = 'BUY' if inferred == 1 else 'SELL'
+            print(f"  [trade] startup: restored {symbol} signal → {side} (ticket #{pos.ticket})")
+            break  # one seed position per symbol is enough
+
+
 # ── Lot sizing ────────────────────────────────────────────────────────────────
 def _get_lot_size(symbol: str, sl_price_units: float) -> float:
     """Risk RISK_PCT% of account balance. Falls back to minimum lot on errors."""
