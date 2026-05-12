@@ -44,10 +44,10 @@ FREEZE_HISTORY    = True
 TRADE_ENABLED      = True   # set True to allow real orders
 TRADE_BOTH_SIDES   = True   # True  = signal 1 → long, signal 0 → short
                               # False = signal 1 → long, signal 0 → close long only
-RISK_PCT           = 1.0   # % of account balance risked per trade
+RISK_PCT           = 0.05   # % of account balance risked per trade
 MAX_SLIPPAGE       = 10     # maximum allowed slippage in points
 MAGIC_NUMBER       = 20260507  # unique tag for orders placed by this script
-TRAIL_ACTIVATE_PCT = 0.35   # activate trailing stop when profit >= 35% of SL distance
+TRAIL_ACTIVATE_PCT = 0.40   # activate trailing stop when profit >= 40% of SL distance
 
 # ── Grid (Fibonacci martingale) ───────────────────────────────────────────────
 GRID_ENABLED           = True   # add Fibonacci-scaled orders when a position is in loss
