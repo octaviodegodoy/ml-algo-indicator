@@ -194,17 +194,23 @@ def load_dom_features(slug: str) -> pd.DataFrame:
     df['ts']  = pd.to_datetime(df['ts'], unit='s', utc=True)
     df['bar'] = df['ts'].dt.floor(f'{TF_SECONDS}s')
     g = df.groupby('bar').agg(
-        dom_spread_bps_mean=('spread_bps',      'mean'),
-        dom_spread_bps_max =('spread_bps',      'max'),
-        dom_top_imb_mean   =('top_imbalance',   'mean'),
-        dom_top_imb_last   =('top_imbalance',   'last'),
-        dom_depth_imb_mean =('depth_imbalance', 'mean'),
-        dom_depth_imb_last =('depth_imbalance', 'last'),
-        dom_bid_vol_mean   =('bid_vol_top',     'mean'),
-        dom_ask_vol_mean   =('ask_vol_top',     'mean'),
-        dom_snap_count     =('spread',          'size'),
+        dom_spread_bps_mean  =('spread_bps',      'mean'),
+        dom_spread_bps_max   =('spread_bps',      'max'),
+        dom_top_imb_mean     =('top_imbalance',   'mean'),
+        dom_top_imb_last     =('top_imbalance',   'last'),
+        dom_depth_imb_mean   =('depth_imbalance', 'mean'),
+        dom_depth_imb_last   =('depth_imbalance', 'last'),
+        dom_bid_vol_mean     =('bid_vol_top',     'mean'),
+        dom_ask_vol_mean     =('ask_vol_top',     'mean'),
+        dom_snap_count       =('spread',          'size'),
+        dom_wmid_drift_sum   =('wmid_drift',      'sum'),    # net weighted-mid pressure over the bar
+        dom_wmid_drift_last  =('wmid_drift',      'last'),   # most recent directional push
+        dom_book_refresh_rate=('book_refreshed',  'mean'),   # fraction of snapshots that saw a quote change
     )
     g.index.name = None
+    # Normalised side volume ratio (bid pressure vs ask pressure, bounded [-1,+1])
+    vol_sum = (g['dom_bid_vol_mean'] + g['dom_ask_vol_mean']).replace(0, np.nan)
+    g['dom_vol_ratio'] = (g['dom_bid_vol_mean'] - g['dom_ask_vol_mean']) / vol_sum
     return g
 
 
@@ -216,12 +222,15 @@ def load_tick_features(slug: str) -> pd.DataFrame:
     df['bar'] = pd.to_datetime(df['ts'], unit='s', utc=True)
     df = df.drop(columns=['ts'])
     g = df.groupby('bar').agg(
-        tick_trade_count=('trade_count', 'sum'),
-        tick_buy_vol    =('buy_vol',     'sum'),
-        tick_sell_vol   =('sell_vol',    'sum'),
-        tick_delta_vol  =('delta_vol',   'sum'),
-        tick_avg_price  =('avg_price',   'mean'),
-        tick_last_price =('last_price',  'last'),
+        tick_trade_count   =('trade_count',      'sum'),
+        tick_buy_vol       =('buy_vol',          'sum'),
+        tick_sell_vol      =('sell_vol',         'sum'),
+        tick_delta_vol     =('delta_vol',        'sum'),
+        tick_avg_price     =('avg_price',        'mean'),
+        tick_last_price    =('last_price',       'last'),
+        tick_absorption    =('absorption_ratio', 'mean'),   # lots per point moved
+        tick_price_eff     =('price_efficiency', 'mean'),   # how directional the bar was
+        tick_price_std     =('price_std',        'mean'),   # intra-bar price volatility
     )
     g['tick_buy_ratio'] = g['tick_buy_vol'] / (g['tick_buy_vol'] + g['tick_sell_vol']).replace(0, np.nan)
     g.index.name = None
@@ -237,9 +246,21 @@ def load_tick_features(slug: str) -> pd.DataFrame:
     cvd_roll_std       = g['cvd'].rolling(20).std().replace(0, np.nan)
     g['cvd_zscore_20'] = (g['cvd'] - cvd_roll_mean) / cvd_roll_std
 
-    price_dir          = np.sign(g['tick_last_price'].diff(5))
-    cvd_dir            = np.sign(g['cvd_change_5'])
-    g['cvd_price_div'] = price_dir * cvd_dir   # -1 = divergence signal
+    # CVD magnitude bins: replace binary divergence flag with signed strength (3 levels each side)
+    price_dir = np.sign(g['tick_last_price'].diff(5))
+    cvd_dir   = np.sign(g['cvd_change_5'])
+    g['cvd_price_div'] = price_dir * cvd_dir   # -1 = divergence, +1 = confirmation
+
+    # CVD magnitude: how large was the delta relative to total volume?
+    total_vol = (g['tick_buy_vol'] + g['tick_sell_vol']).replace(0, np.nan)
+    g['cvd_magnitude'] = g['tick_delta_vol'].abs() / total_vol   # 0=balanced, 1=all one side
+    g['cvd_signed_mag'] = g['tick_delta_vol'] / total_vol         # signed: +1=all buy, -1=all sell
+
+    # Absorption rolling z-score (normalise across session)
+    if 'tick_absorption' in g.columns:
+        abs_mean = g['tick_absorption'].rolling(20).mean()
+        abs_std  = g['tick_absorption'].rolling(20).std().replace(0, np.nan)
+        g['absorption_zscore'] = (g['tick_absorption'] - abs_mean) / abs_std
 
     return g
 

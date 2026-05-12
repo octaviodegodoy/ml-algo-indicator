@@ -17,6 +17,7 @@
 import os
 import time
 from collections import deque
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import numpy as np
@@ -30,7 +31,7 @@ from config import (
     TARGETS, TIMEFRAME, N_BARS,
     TB_MAX_BARS, TB_PT_MULT, TB_SL_MULT,
     PROB_THRESHOLD, N_SPLITS_CV, MIN_MICRO_ROWS,
-    FREEZE_HISTORY, TRADE_ENABLED, out_path,
+    FREEZE_HISTORY, TRADE_ENABLED, TRADE_SESSIONS, out_path,
 )
 from mt5_client import (
     mt5_setup, fetch_bars, append_dom_snapshot, fetch_and_aggregate_ticks,
@@ -48,6 +49,18 @@ from trade import execute_trade, manage_trailing_stops, manage_grid_orders, init
 
 # ── Signal persistence buffer (per symbol, last 2 evaluations) ───────────────
 _signal_buffer: dict = {}   # symbol → deque(maxlen=2)
+
+_BRT = timezone(timedelta(hours=-3))
+
+
+def _in_trade_session() -> bool:
+    """Return True if current BRT wall-clock time falls inside a TRADE_SESSIONS window."""
+    now = datetime.now(_BRT)
+    hm  = (now.hour, now.minute)
+    for start, end in TRADE_SESSIONS:
+        if start <= hm < end:
+            return True
+    return False
 
 
 # ── Per-target processing ─────────────────────────────────────────────────────
@@ -186,6 +199,9 @@ def process_target(target: dict) -> str:
     # Quality gate: precision floor is 0.505 (barely above random); edge check is the main guard
     if metrics['precision'] < 0.505 or _edge < 0.02:
         print(f"[{symbol}] low-edge model (prec={metrics['precision']:.3f} edge={_edge:+.3f}) — skipping trade")
+    elif not _in_trade_session():
+        brt_now = datetime.now(_BRT).strftime('%H:%M')
+        print(f"[{symbol}] outside liquid session (BRT {brt_now}) — skipping trade")
     else:
         buf = _signal_buffer.setdefault(symbol, deque(maxlen=2))
         buf.append(latest_signal)

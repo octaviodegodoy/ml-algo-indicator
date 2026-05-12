@@ -5,16 +5,19 @@ mt5_client.py — MT5 lifecycle, bar fetching, DOM snapshots, and tick aggregati
 import os
 import time
 import atexit
+import threading
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 import MetaTrader5 as mt5
 
-from config import TARGETS, DOM_LEVELS, TF_SECONDS, dom_path, ticks_path
+from config import TARGETS, DOM_LEVELS, DOM_SAMPLE_SECS, TF_SECONDS, dom_path, ticks_path
 
 # ── MT5 lifecycle ─────────────────────────────────────────────────────────────
-_subscribed_books: list = []
+_subscribed_books:  list          = []
+_dom_thread:        Optional[threading.Thread] = None
+_dom_thread_stop:   threading.Event            = threading.Event()
 
 
 def mt5_setup() -> None:
@@ -34,9 +37,13 @@ def mt5_setup() -> None:
         else:
             print(f"Warning: market_book_add({s}) failed — DOM features unavailable for it")
     print(f"MT5 connected. Targets: {[t['symbol'] for t in TARGETS]}")
+    _start_dom_thread()
 
 
 def mt5_teardown() -> None:
+    _dom_thread_stop.set()
+    if _dom_thread is not None:
+        _dom_thread.join(timeout=10)
     for s in _subscribed_books:
         try:
             mt5.market_book_release(s)
@@ -63,6 +70,12 @@ def fetch_bars(symbol: str, timeframe, n: int) -> Optional[pd.DataFrame]:
 
 
 # ── DOM snapshot collector ────────────────────────────────────────────────────
+# Per-symbol state for refresh-rate and absorption tracking
+_dom_prev_bid: dict = {}   # symbol → best_bid at last snapshot
+_dom_prev_ask: dict = {}   # symbol → best_ask at last snapshot
+_dom_prev_mid: dict = {}   # symbol → weighted mid at last snapshot
+
+
 def _snapshot_dom(symbol: str) -> Optional[dict]:
     book = mt5.market_book_get(symbol)
     if book is None or len(book) == 0:
@@ -85,6 +98,22 @@ def _snapshot_dom(symbol: str) -> Optional[dict]:
     ask_vol_n = sum(v for _, v in asks[:DOM_LEVELS])
     total     = bid_vol_n + ask_vol_n
 
+    # Weighted mid-price: fairer fair-value estimate than simple mid
+    w_mid = (ask_vol_n * best_bid + bid_vol_n * best_ask) / total if total > 0 else mid
+
+    # Book refresh rate: did the best quotes move since last snapshot?
+    prev_bid      = _dom_prev_bid.get(symbol, best_bid)
+    prev_ask      = _dom_prev_ask.get(symbol, best_ask)
+    book_refreshed = int(best_bid != prev_bid or best_ask != prev_ask)
+
+    # Weighted mid drift from last snapshot (directional pressure)
+    prev_mid   = _dom_prev_mid.get(symbol, w_mid)
+    wmid_drift = w_mid - prev_mid
+
+    _dom_prev_bid[symbol] = best_bid
+    _dom_prev_ask[symbol] = best_ask
+    _dom_prev_mid[symbol] = w_mid
+
     return {
         'ts':              int(time.time()),
         'spread':          spread,
@@ -96,16 +125,51 @@ def _snapshot_dom(symbol: str) -> Optional[dict]:
         'ask_vol_top':     ask_vol_n,
         'best_bid':        best_bid,
         'best_ask':        best_ask,
+        'weighted_mid':    w_mid,
+        'wmid_drift':      wmid_drift,
+        'book_refreshed':  book_refreshed,
     }
 
 
 def append_dom_snapshot(symbol: str, slug: str) -> bool:
+    """Called from main loop to confirm DOM is live; actual high-freq sampling is on background thread."""
     snap = _snapshot_dom(symbol)
     if snap is None:
         return False
     path = dom_path(slug)
     pd.DataFrame([snap]).to_csv(path, mode='a', header=not os.path.exists(path), index=False)
     return True
+
+
+def _dom_sampling_thread() -> None:
+    """Background thread: samples DOM every DOM_SAMPLE_SECS for all subscribed symbols."""
+    slug_map = {t['symbol']: t['slug'] for t in TARGETS}
+    while not _dom_thread_stop.is_set():
+        for symbol in _subscribed_books:
+            slug = slug_map.get(symbol)
+            if slug is None:
+                continue
+            snap = _snapshot_dom(symbol)
+            if snap is None:
+                continue
+            path = dom_path(slug)
+            try:
+                pd.DataFrame([snap]).to_csv(
+                    path, mode='a', header=not os.path.exists(path), index=False
+                )
+            except Exception:
+                pass
+        _dom_thread_stop.wait(timeout=DOM_SAMPLE_SECS)
+
+
+def _start_dom_thread() -> None:
+    global _dom_thread
+    if not _subscribed_books:
+        return
+    _dom_thread_stop.clear()
+    _dom_thread = threading.Thread(target=_dom_sampling_thread, name='dom_sampler', daemon=True)
+    _dom_thread.start()
+    print(f"DOM background sampler started (every {DOM_SAMPLE_SECS}s)")
 
 
 # ── Trade-tick aggregator ─────────────────────────────────────────────────────
@@ -143,10 +207,26 @@ def fetch_and_aggregate_ticks(symbol: str, slug: str) -> int:
         sell_vol   =('vol', lambda v: v[df.loc[v.index, 'is_sell'] > 0].sum()),
         avg_price  =('price', 'mean'),
         last_price =('price', 'last'),
+        first_price=('price', 'first'),
+        max_price  =('price', 'max'),
+        min_price  =('price', 'min'),
+        price_std  =('price', 'std'),
     ).reset_index()
     agg['delta_vol'] = agg['buy_vol'] - agg['sell_vol']
-    agg['ts']        = agg['bar'].astype('int64') // 10**9
-    agg = agg[['ts', 'trade_count', 'buy_vol', 'sell_vol', 'delta_vol', 'avg_price', 'last_price']]
+    total_vol        = agg['buy_vol'] + agg['sell_vol']
+
+    # Absorption ratio: heavy volume relative to price movement within the bar
+    # High ratio = large trades absorbed without proportional price move → hidden resistance/support
+    price_range = (agg['max_price'] - agg['min_price']).replace(0, np.nan)
+    agg['absorption_ratio'] = total_vol / price_range   # lots per point moved
+
+    # Price efficiency: how much of the bar range was actually used (tight = contested, wide = breakout)
+    agg['price_efficiency'] = (agg['last_price'] - agg['first_price']).abs() / price_range.replace(np.nan, 1)
+    agg['price_efficiency'] = agg['price_efficiency'].fillna(0)
+
+    agg['ts'] = agg['bar'].astype('int64') // 10**9
+    agg = agg[['ts', 'trade_count', 'buy_vol', 'sell_vol', 'delta_vol',
+               'avg_price', 'last_price', 'absorption_ratio', 'price_efficiency', 'price_std']]
 
     path = ticks_path(slug)
     agg.to_csv(path, mode='a', header=not os.path.exists(path), index=False)

@@ -31,8 +31,22 @@ RECENCY_DECAY     = 1.2          # lowered from 2.0 — reduces oversensitivity 
 
 # ── Microstructure ────────────────────────────────────────────────────────────
 DOM_LEVELS        = 5            # top-N book levels to aggregate
+DOM_SAMPLE_SECS   = 5            # background thread samples DOM every N seconds (was once per 60s cycle)
 MIN_MICRO_ROWS    = 50           # need ≥ this many bars with micro data before using features
 HTF_BARS          = 500          # H1 bars to fetch for higher-timeframe context
+
+# ── Trading session filter (BRT = UTC-3) ─────────────────────────────────────
+# B3 WIN liquidity profile:
+#   09:00-09:05  opening auction            → avoid (thin, volatile)
+#   09:05-12:00  morning session            → liquid  ✓
+#   12:00-13:30  lunch/dead zone            → avoid (wide spreads)
+#   13:30-17:55  afternoon + US-open window → liquid  ✓  (peak 14:30-16:00)
+#   17:55-18:00  close / final auction      → avoid
+# Times are (hour, minute) tuples in BRT (UTC-3). Python datetime.now(tz) for BRT.
+TRADE_SESSIONS = [
+    ((9,  5), (12,  0)),   # morning session
+    ((13, 30), (17, 55)),  # afternoon session
+]
 
 # ── Signal freeze ─────────────────────────────────────────────────────────────
 # Once a bar is older than the current forming bar its signal is locked in the
