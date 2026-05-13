@@ -1,0 +1,6 @@
+# MetaTrader compiled binaries
+*.ex5
+
+# Python cache
+__pycache__/
+*.pyc
