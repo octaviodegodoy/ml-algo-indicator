@@ -54,10 +54,6 @@ void PlotSignals()
    if(lastBarTime <= 0) lastBarTime = TimeCurrent();
    datetime cutoff = lastBarTime - LookbackDays * 86400;
 
-   PrintFormat("PlotSignals: chart=%s/%s  bars=%d  lastBar=%s  cutoff=%s",
-               sym, EnumToString(tf), barsAvail,
-               TimeToString(lastBarTime), TimeToString(cutoff));
-
    if(barsAvail < 10)
      {
       Print("Series not ready — will retry on next tick");

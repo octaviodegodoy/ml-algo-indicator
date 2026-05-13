@@ -121,8 +121,6 @@ def compute_sl_points(
     """
     atr_full = atr14.reindex(signal_series.index).values
     fixed_sl = float(np.nanmedian(atr_full) * sl_mult) if np.any(~np.isnan(atr_full)) else 0.0
-    print(f"  SL (fixed median-ATR×{sl_mult}) = {fixed_sl:.0f}p  "
-          f"(computed over {np.sum(~np.isnan(atr_full))} bars)")
 
     sig = signal_series.values
     n   = len(sig)

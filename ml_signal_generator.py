@@ -64,24 +64,25 @@ def _in_trade_session() -> bool:
 
 
 # ── Per-target processing ─────────────────────────────────────────────────────
-def process_target(target: dict) -> str:
+def process_target(target: dict) -> None:
     symbol = target["symbol"]
     slug   = target["slug"]
 
     # 1. Live microstructure snapshot
-    dom_ok      = append_dom_snapshot(symbol, slug)
-    n_tick_rows = fetch_and_aggregate_ticks(symbol, slug)
+    append_dom_snapshot(symbol, slug)
+    fetch_and_aggregate_ticks(symbol, slug)
 
     # 2. Bars
     bars = fetch_bars(symbol, TIMEFRAME, N_BARS)
     if bars is None:
-        return f"[{symbol}] no bars"
+        print(f"[{symbol}] no bars")
+        return
 
     # 3. Features
     feats = make_features(bars)
     feats = add_time_features(feats)
-    feats, n_dom_used  = merge_microstructure(feats, load_dom_features(slug),  prefix="dom")
-    feats, n_tick_used = merge_microstructure(feats, load_tick_features(slug), prefix="tick")
+    feats, _  = merge_microstructure(feats, load_dom_features(slug),  prefix="dom")
+    feats, _  = merge_microstructure(feats, load_tick_features(slug), prefix="tick")
     htf_feats = make_htf_features(symbol, bars)
     if not htf_feats.empty:
         feats = pd.concat([feats, htf_feats], axis=1)
@@ -95,13 +96,11 @@ def process_target(target: dict) -> str:
     aligned = aligned.dropna(subset=feats.columns.tolist(),
                               thresh=int(len(feats.columns) * 0.6))
     if len(aligned) < 500:
-        return f"[{symbol}] not enough rows: {len(aligned)}"
+        print(f"[{symbol}] not enough rows: {len(aligned)}")
+        return
 
     X = aligned.drop(columns=["y"])
     y = aligned["y"].astype(int)
-
-    buy_rate = float(y.mean())
-    print(f"[{symbol}] label distribution: buy={buy_rate:.1%}  sell={1-buy_rate:.1%}  n={len(y)}")
 
     # 6. Train
     rec_weights = compute_recency_weights(len(aligned))
@@ -116,8 +115,6 @@ def process_target(target: dict) -> str:
     model.fit(X, y, gb__sample_weight=rec_weights)
 
     proba  = model.predict_proba(X)[:, 1]
-    print(f"[{symbol}] proba stats: min={proba.min():.3f} max={proba.max():.3f} "
-          f"mean={proba.mean():.3f} pct>threshold={(proba > PROB_THRESHOLD).mean():.1%}")
     signal = (proba > PROB_THRESHOLD).astype(int)
 
     sig_series = pd.Series(signal, index=X.index)
@@ -134,6 +131,7 @@ def process_target(target: dict) -> str:
     })
 
     # 7. Score the unlabeled tail (live bars without future reference)
+    latest_proba = float(proba[-1])
     tail_feats = feats[~feats.index.isin(aligned.index)]
     tail_feats = tail_feats.dropna(thresh=int(len(feats.columns) * 0.6))
     if len(tail_feats) > 0:
@@ -154,7 +152,7 @@ def process_target(target: dict) -> str:
             "SL_Points": tail_sl,
         })
         new_df = pd.concat([new_df, tail_df], ignore_index=True)
-        print(f"[{symbol}] tail bars scored: {len(tail_df)}  buys={int(tail_signal.sum())}")
+        latest_proba = float(tail_proba[-1])
 
     # 8. Write CSV (with optional history freeze)
     csv_path = out_path(slug)
@@ -163,7 +161,6 @@ def process_target(target: dict) -> str:
             _old = pd.read_csv(csv_path)
             if (_old["ML_Signal"] == 1).sum() == 0:
                 os.remove(csv_path)
-                print(f"[{symbol}] stale all-zero CSV removed")
         except Exception:
             pass
 
@@ -180,7 +177,6 @@ def process_target(target: dict) -> str:
                 merged   = merged.drop_duplicates(subset="Timestamp", keep="last")
                 merged   = merged.sort_values("Timestamp")
                 merged["SL_Points"] = merged["SL_Points"].fillna(0).astype(int)
-                n_frozen = len(frozen)
                 merged.to_csv(csv_path, index=False)
             else:
                 new_df.to_csv(csv_path, index=False)
@@ -193,41 +189,17 @@ def process_target(target: dict) -> str:
     # 9. Execute trade on latest signal (quality gate + 2-bar persistence filter)
     latest_signal = int(new_df.sort_values("Timestamp").iloc[-1]["ML_Signal"])
     _edge = metrics['precision'] - metrics['baseline_rate']
-    _pct_buy = float((proba > PROB_THRESHOLD).mean())
-    print(f"[{symbol}] prob dist: pct>threshold={_pct_buy:.1%}  "
-          f"latest_signal={latest_signal}  edge={_edge:+.3f}  prec={metrics['precision']:.3f}")
+    signal_label  = "BUY" if latest_signal == 1 else "SELL/FLAT"
+    trigger       = "TRIGGERED" if latest_proba > PROB_THRESHOLD else "below"
+    print(f"[{symbol}] signal={signal_label}  proba={latest_proba:.3f} {'>' if latest_proba > PROB_THRESHOLD else '<'} threshold={PROB_THRESHOLD}  ({trigger})  edge={_edge:+.3f}  prec={metrics['precision']:.3f}  sl={avg_sl_val}p")
     # Quality gate: precision floor is 0.505 (barely above random); edge check is the main guard
-    if metrics['precision'] < 0.505 or _edge < 0.02:
-        print(f"[{symbol}] low-edge model (prec={metrics['precision']:.3f} edge={_edge:+.3f}) — skipping trade")
-    elif not _in_trade_session():
-        brt_now = datetime.now(_BRT).strftime('%H:%M')
-        print(f"[{symbol}] outside liquid session (BRT {brt_now}) — skipping trade")
-    else:
+    if metrics['precision'] >= 0.505 and _edge >= 0.02 and _in_trade_session():
         buf = _signal_buffer.setdefault(symbol, deque(maxlen=2))
         buf.append(latest_signal)
-        print(f"[{symbol}] persistence buffer: {list(buf)}")
         if len(buf) >= 2 and len(set(buf)) == 1:
             execute_trade(symbol, latest_signal, avg_sl_val)
-        else:
-            print(f"[{symbol}] signal not yet confirmed ({list(buf)}) — holding")
 
-    extras     = []
-    if n_dom_used  >= MIN_MICRO_ROWS: extras.append(f"+dom({n_dom_used})")
-    if n_tick_used >= MIN_MICRO_ROWS: extras.append(f"+tick({n_tick_used})")
-    edge        = metrics["precision"] - metrics["baseline_rate"]
-    trade_state = "ON" if TRADE_ENABLED else "OFF"
-    trade_tag   = f"trade={trade_state}(sig={latest_signal})"
-    freeze_tag  = f"frozen={n_frozen}" if FREEZE_HISTORY else "freeze=off"
-    dom_tag     = "OK" if dom_ok else "no"
-    extras_str  = " ".join(extras)
-    return (
-        f"[{symbol}] {extras_str} rows={len(new_df)} "
-        f"buys={int(signal.sum())} ({signal.mean():.1%}) "
-        f"acc={metrics['accuracy']:.3f} prec={metrics['precision']:.3f} "
-        f"rec={metrics['recall']:.3f} base={metrics['baseline_rate']:.3f} "
-        f"edge={edge:+.3f} | dom_snap={dom_tag} "
-        f"new_tick_bars={n_tick_rows} {freeze_tag} {trade_tag}"
-    )
+    return None
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -235,11 +207,10 @@ def run_once() -> None:
     now = pd.Timestamp.now().strftime("%H:%M:%S")
     for t in TARGETS:
         try:
-            line = process_target(t)
+            process_target(t)
         except Exception as e:
             sym = t["symbol"]
-            line = f"[{sym}] ERROR: {e}"
-        print(f"[{now}] {line}")
+            print(f"[{now}] [{sym}] ERROR: {e}")
 
 
 def _latest_bar_time(symbol: str) -> Optional[int]:
