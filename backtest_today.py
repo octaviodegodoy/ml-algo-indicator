@@ -18,6 +18,7 @@ Run:
     python backtest_today.py
 """
 
+import os
 import sys
 from collections import deque
 
@@ -114,10 +115,9 @@ def train_and_score(bars_train: pd.DataFrame, bars_test: pd.DataFrame, p: dict):
 
     if p["use_quality_gate"] and (metrics["precision"] < 0.505 or edge < 0.02):
         print(
-            f"    Quality gate REJECTED  "
-            f"prec={metrics['precision']:.3f}  edge={edge:+.3f} → no trades"
+            f"    Quality gate would REJECT  "
+            f"prec={metrics['precision']:.3f}  edge={edge:+.3f}  (continuing for backtest visibility)"
         )
-        return None, metrics
 
     model = Pipeline(
         [
@@ -230,13 +230,14 @@ def simulate_pnl(bars_test: pd.DataFrame, signal_series: pd.Series, sl_mult: flo
             prev_sig = sig
             continue
 
-        if sig != prev_sig and prev_sig != -1:
-            # Signal flip
-            if in_trade and not np.isnan(c):
-                _close_trade(ts, c, "SIGNAL")
-                in_trade = False
+        # Direction flip while in a trade → close it
+        if in_trade and sig != prev_sig and prev_sig != -1 and not np.isnan(c):
+            _close_trade(ts, c, "SIGNAL")
+            in_trade = False
 
-            # Open new position
+        # Open a trade whenever we have a confirmed signal and are flat
+        # (retry every bar so NaN ATR at warm-up doesn't permanently block entry)
+        if not in_trade:
             atr_val = float(atr_test.get(ts, np.nan))
             if not np.isnan(c) and not np.isnan(atr_val) and atr_val > 0:
                 entry_price = c
@@ -430,7 +431,7 @@ def main():
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
     plt.setp(axes[-1].xaxis.get_majorticklabels(), rotation=30, ha="right")
     plt.tight_layout()
-    out_path = "backtest_today.png"
+    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_today.png")
     plt.savefig(out_path, dpi=150)
     print(f"\n  Chart saved → {out_path}")
     plt.show()

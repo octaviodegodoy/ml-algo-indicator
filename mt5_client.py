@@ -22,6 +22,9 @@ _dom_thread_stop:   threading.Event            = threading.Event()
 # Tracks which DOM CSV paths have already been schema-validated this session
 _dom_schema_validated: set = set()
 
+# Symbols for which the broker does not provide tick history (detected at startup)
+_no_tick_symbols: set = set()
+
 
 def _ensure_dom_schema(path: str, snap: dict) -> None:
     """Delete DOM CSV if its column schema no longer matches the current snapshot keys.
@@ -63,7 +66,34 @@ def mt5_setup() -> None:
         else:
             print(f"Warning: market_book_add({s}) failed — DOM features unavailable for it")
     print(f"MT5 connected. Targets: {[t['symbol'] for t in TARGETS]}")
+    _check_broker_capabilities()
     _start_dom_thread()
+
+
+def _check_broker_capabilities() -> None:
+    """One-time startup check: log which data sources are available per symbol."""
+    import time as _time
+    now = int(_time.time())
+    print("── Broker capability check ──────────────────────────────")
+    for t in TARGETS:
+        s    = t['symbol']
+        # DOM
+        book = mt5.market_book_get(s)
+        dom_ok = book is not None and len(book) > 0
+        # Ticks (last 10 minutes)
+        ticks = mt5.copy_ticks_range(
+            s,
+            pd.to_datetime(now - 600, unit='s'),
+            pd.to_datetime(now,       unit='s'),
+            mt5.COPY_TICKS_TRADE,
+        )
+        tick_ok = ticks is not None and len(ticks) > 0
+        print(f"  {s}:  DOM={'YES (' + str(len(book)) + ' levels)' if dom_ok else 'NO — L2 not provided by broker'}  |  "
+              f"Ticks={'YES (' + str(len(ticks)) + ')' if tick_ok else 'NO — tick history not provided by broker'}")
+        if not tick_ok:
+            # Mark symbol so fetch_and_aggregate_ticks skips it silently
+            _no_tick_symbols.add(s)
+    print("─────────────────────────────────────────────────────────")
 
 
 def mt5_teardown() -> None:
@@ -228,6 +258,8 @@ _last_tick_ts: dict = {}  # per-symbol incremental cursor
 
 
 def fetch_and_aggregate_ticks(symbol: str, slug: str) -> int:
+    if symbol in _no_tick_symbols:
+        return 0
     now   = int(time.time())
     start = _last_tick_ts.get(symbol, 0) or (now - 3600)
     ticks = mt5.copy_ticks_range(
