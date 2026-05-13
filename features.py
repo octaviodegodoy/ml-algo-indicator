@@ -193,6 +193,18 @@ def load_dom_features(slug: str) -> pd.DataFrame:
     df = pd.read_csv(path)
     df['ts']  = pd.to_datetime(df['ts'], unit='s', utc=True)
     df['bar'] = df['ts'].dt.floor(f'{TF_SECONDS}s')
+    # Backfill columns added after initial data collection (old CSVs may lack them)
+    for _col, _default in [
+        ('wmid_drift',       0.0),
+        ('book_refreshed',   0),
+        ('large_bid_vol',    0.0),
+        ('large_ask_vol',    0.0),
+        ('large_bid_levels', 0),
+        ('large_ask_levels', 0),
+        ('large_imbalance',  0.0),
+    ]:
+        if _col not in df.columns:
+            df[_col] = _default
     g = df.groupby('bar').agg(
         dom_spread_bps_mean  =('spread_bps',      'mean'),
         dom_spread_bps_max   =('spread_bps',      'max'),
