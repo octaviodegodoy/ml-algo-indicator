@@ -19,6 +19,32 @@ _subscribed_books:  list          = []
 _dom_thread:        Optional[threading.Thread] = None
 _dom_thread_stop:   threading.Event            = threading.Event()
 
+# Tracks which DOM CSV paths have already been schema-validated this session
+_dom_schema_validated: set = set()
+
+
+def _ensure_dom_schema(path: str, snap: dict) -> None:
+    """Delete DOM CSV if its column schema no longer matches the current snapshot keys.
+
+    Runs at most once per file path per process lifetime to avoid repeated I/O.
+    """
+    if path in _dom_schema_validated:
+        return
+    _dom_schema_validated.add(path)
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, 'r') as _f:
+            header_cols = _f.readline().strip().split(',')
+        if set(header_cols) != set(snap.keys()):
+            os.remove(path)
+            print(f"DOM schema mismatch — stale file removed: {path}")
+    except Exception:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
 
 def mt5_setup() -> None:
     if not mt5.initialize():
@@ -160,6 +186,7 @@ def append_dom_snapshot(symbol: str, slug: str) -> bool:
     if snap is None:
         return False
     path = dom_path(slug)
+    _ensure_dom_schema(path, snap)
     pd.DataFrame([snap]).to_csv(path, mode='a', header=not os.path.exists(path), index=False)
     return True
 
@@ -177,6 +204,7 @@ def _dom_sampling_thread() -> None:
                 continue
             path = dom_path(slug)
             try:
+                _ensure_dom_schema(path, snap)
                 pd.DataFrame([snap]).to_csv(
                     path, mode='a', header=not os.path.exists(path), index=False
                 )
