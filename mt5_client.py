@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import MetaTrader5 as mt5
 
-from config import TARGETS, DOM_LEVELS, DOM_SAMPLE_SECS, TF_SECONDS, dom_path, ticks_path
+from config import TARGETS, DOM_LEVELS, DOM_SAMPLE_SECS, DOM_MIN_LEVEL_LOTS, DOM_LARGE_ORDER_LOTS, TF_SECONDS, dom_path, ticks_path
 
 # ── MT5 lifecycle ─────────────────────────────────────────────────────────────
 _subscribed_books:  list          = []
@@ -89,14 +89,31 @@ def _snapshot_dom(symbol: str) -> Optional[dict]:
     bids.sort(key=lambda x: -x[0])
     asks.sort(key=lambda x:  x[0])
 
-    best_bid, best_bid_vol = bids[0]
-    best_ask, best_ask_vol = asks[0]
+    # Filter noise: drop levels below minimum lot threshold
+    bids_f = [(p, v) for p, v in bids if v >= DOM_MIN_LEVEL_LOTS]
+    asks_f = [(p, v) for p, v in asks if v >= DOM_MIN_LEVEL_LOTS]
+    # Fall back to unfiltered if too thin (e.g. pre-market)
+    if not bids_f or not asks_f:
+        bids_f, asks_f = bids, asks
+
+    best_bid, best_bid_vol = bids_f[0]
+    best_ask, best_ask_vol = asks_f[0]
     mid    = (best_bid + best_ask) / 2.0
     spread = best_ask - best_bid
 
-    bid_vol_n = sum(v for _, v in bids[:DOM_LEVELS])
-    ask_vol_n = sum(v for _, v in asks[:DOM_LEVELS])
+    bid_vol_n = sum(v for _, v in bids_f[:DOM_LEVELS])
+    ask_vol_n = sum(v for _, v in asks_f[:DOM_LEVELS])
     total     = bid_vol_n + ask_vol_n
+
+    # Large / iceberg order detection: levels ≥ DOM_LARGE_ORDER_LOTS
+    large_bids = [(p, v) for p, v in bids_f[:DOM_LEVELS] if v >= DOM_LARGE_ORDER_LOTS]
+    large_asks = [(p, v) for p, v in asks_f[:DOM_LEVELS] if v >= DOM_LARGE_ORDER_LOTS]
+    large_bid_levels = len(large_bids)
+    large_ask_levels = len(large_asks)
+    large_bid_vol    = sum(v for _, v in large_bids)
+    large_ask_vol    = sum(v for _, v in large_asks)
+    large_total      = large_bid_vol + large_ask_vol
+    large_imbalance  = (large_bid_vol - large_ask_vol) / large_total if large_total > 0 else 0.0
 
     # Weighted mid-price: fairer fair-value estimate than simple mid
     w_mid = (ask_vol_n * best_bid + bid_vol_n * best_ask) / total if total > 0 else mid
@@ -115,19 +132,25 @@ def _snapshot_dom(symbol: str) -> Optional[dict]:
     _dom_prev_mid[symbol] = w_mid
 
     return {
-        'ts':              int(time.time()),
-        'spread':          spread,
-        'spread_bps':      (spread / mid * 1e4) if mid > 0 else np.nan,
-        'top_imbalance':   (best_bid_vol - best_ask_vol) / (best_bid_vol + best_ask_vol)
-                           if (best_bid_vol + best_ask_vol) > 0 else 0.0,
-        'depth_imbalance': (bid_vol_n - ask_vol_n) / total if total > 0 else 0.0,
-        'bid_vol_top':     bid_vol_n,
-        'ask_vol_top':     ask_vol_n,
-        'best_bid':        best_bid,
-        'best_ask':        best_ask,
-        'weighted_mid':    w_mid,
-        'wmid_drift':      wmid_drift,
-        'book_refreshed':  book_refreshed,
+        'ts':               int(time.time()),
+        'spread':           spread,
+        'spread_bps':       (spread / mid * 1e4) if mid > 0 else np.nan,
+        'top_imbalance':    (best_bid_vol - best_ask_vol) / (best_bid_vol + best_ask_vol)
+                            if (best_bid_vol + best_ask_vol) > 0 else 0.0,
+        'depth_imbalance':  (bid_vol_n - ask_vol_n) / total if total > 0 else 0.0,
+        'bid_vol_top':      bid_vol_n,
+        'ask_vol_top':      ask_vol_n,
+        'best_bid':         best_bid,
+        'best_ask':         best_ask,
+        'weighted_mid':     w_mid,
+        'wmid_drift':       wmid_drift,
+        'book_refreshed':   book_refreshed,
+        # Large-order / iceberg fields
+        'large_bid_levels': large_bid_levels,
+        'large_ask_levels': large_ask_levels,
+        'large_bid_vol':    large_bid_vol,
+        'large_ask_vol':    large_ask_vol,
+        'large_imbalance':  large_imbalance,   # +1 = all big lots on bid, -1 = all on ask
     }
 
 

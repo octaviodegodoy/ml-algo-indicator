@@ -30,10 +30,12 @@ N_SPLITS_CV       = 5
 RECENCY_DECAY     = 1.2          # lowered from 2.0 — reduces oversensitivity to single volatile bars
 
 # ── Microstructure ────────────────────────────────────────────────────────────
-DOM_LEVELS        = 5            # top-N book levels to aggregate
-DOM_SAMPLE_SECS   = 5            # background thread samples DOM every N seconds (was once per 60s cycle)
-MIN_MICRO_ROWS    = 50           # need ≥ this many bars with micro data before using features
-HTF_BARS          = 500          # H1 bars to fetch for higher-timeframe context
+DOM_LEVELS            = 5     # top-N book levels to aggregate
+DOM_SAMPLE_SECS       = 5     # background thread samples DOM every N seconds (was once per 60s cycle)
+DOM_MIN_LEVEL_LOTS    = 5     # ignore book levels with fewer lots than this (noise / 1-lot algos)
+DOM_LARGE_ORDER_LOTS  = 100   # threshold to classify a level as a resting large/iceberg order
+MIN_MICRO_ROWS        = 50    # need ≥ this many bars with micro data before using features
+HTF_BARS              = 500   # H1 bars to fetch for higher-timeframe context
 
 # ── Trading session filter (BRT = UTC-3) ─────────────────────────────────────
 # B3 WIN liquidity profile:

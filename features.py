@@ -203,14 +203,25 @@ def load_dom_features(slug: str) -> pd.DataFrame:
         dom_bid_vol_mean     =('bid_vol_top',     'mean'),
         dom_ask_vol_mean     =('ask_vol_top',     'mean'),
         dom_snap_count       =('spread',          'size'),
-        dom_wmid_drift_sum   =('wmid_drift',      'sum'),    # net weighted-mid pressure over the bar
-        dom_wmid_drift_last  =('wmid_drift',      'last'),   # most recent directional push
-        dom_book_refresh_rate=('book_refreshed',  'mean'),   # fraction of snapshots that saw a quote change
+        dom_wmid_drift_sum   =('wmid_drift',      'sum'),      # net weighted-mid pressure over the bar
+        dom_wmid_drift_last  =('wmid_drift',      'last'),     # most recent directional push
+        dom_book_refresh_rate=('book_refreshed',  'mean'),     # fraction of snapshots that saw a quote change
+        # Large / iceberg order aggregations (noise-filtered, >= DOM_LARGE_ORDER_LOTS)
+        dom_large_bid_vol    =('large_bid_vol',   'mean'),     # avg resting big-lot bid volume per bar
+        dom_large_ask_vol    =('large_ask_vol',   'mean'),     # avg resting big-lot ask volume per bar
+        dom_large_bid_levels =('large_bid_levels','mean'),     # avg count of large bid levels visible
+        dom_large_ask_levels =('large_ask_levels','mean'),     # avg count of large ask levels visible
+        dom_large_imb_mean   =('large_imbalance', 'mean'),     # directional lean of large orders [-1,+1]
+        dom_large_imb_last   =('large_imbalance', 'last'),     # most recent snapshot large-order lean
     )
     g.index.name = None
     # Normalised side volume ratio (bid pressure vs ask pressure, bounded [-1,+1])
     vol_sum = (g['dom_bid_vol_mean'] + g['dom_ask_vol_mean']).replace(0, np.nan)
     g['dom_vol_ratio'] = (g['dom_bid_vol_mean'] - g['dom_ask_vol_mean']) / vol_sum
+    # Large-order dominance: what fraction of total visible depth is in large orders?
+    large_total = (g['dom_large_bid_vol'] + g['dom_large_ask_vol'])
+    all_total   = (g['dom_bid_vol_mean']  + g['dom_ask_vol_mean']).replace(0, np.nan)
+    g['dom_large_pct'] = large_total / all_total   # 0 = all small orders, 1 = book dominated by big lots
     return g
 
 

@@ -42,7 +42,7 @@ from mt5_client import fetch_bars, mt5_setup
 SYMBOL       = "WINM26"
 TIMEFRAME    = mt5.TIMEFRAME_M5
 N_TRAIN_BARS = 5000
-LOTS         = 1       # fixed 1 mini lot per trade for a fair comparison
+LOTS         = 5       # fixed 1 mini lot per trade for a fair comparison
 TICK_VALUE   = 0.20    # R$ per point per mini lot (WINM26 standard)
 COMMISSION   = LOTS * 2.0  # R$ per round trip (1 × entry + 1 × exit fee)
 N_SPLITS_CV  = 5
