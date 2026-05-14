@@ -102,6 +102,12 @@ def process_target(target: dict) -> None:
     X = aligned.drop(columns=["y"])
     y = aligned["y"].astype(int)
 
+    # Drop columns that are 100% NaN (e.g., DOM features before snapshots accumulate)
+    # — silences SimpleImputer "Skipping features without any observed values" warning.
+    all_nan_cols = X.columns[X.isna().all()].tolist()
+    if all_nan_cols:
+        X = X.drop(columns=all_nan_cols)
+
     # 6. Train
     rec_weights = compute_recency_weights(len(aligned))
     metrics     = evaluate_walkforward(X, y, N_SPLITS_CV, embargo=TB_MAX_BARS,
@@ -135,6 +141,7 @@ def process_target(target: dict) -> None:
     tail_feats = feats[~feats.index.isin(aligned.index)]
     tail_feats = tail_feats.dropna(thresh=int(len(feats.columns) * 0.6))
     if len(tail_feats) > 0:
+        tail_feats  = tail_feats.reindex(columns=X.columns, fill_value=np.nan)
         tail_proba  = model.predict_proba(tail_feats)[:, 1]
         tail_signal = (tail_proba > PROB_THRESHOLD).astype(int)
         prev_sig    = int(signal[-1]) if len(signal) > 0 else 0
@@ -153,6 +160,12 @@ def process_target(target: dict) -> None:
         })
         new_df = pd.concat([new_df, tail_df], ignore_index=True)
         latest_proba = float(tail_proba[-1])
+
+    # Capture latest signal BEFORE freeze-merge can filter new_df down to zero rows
+    if not new_df.empty:
+        latest_signal = int(new_df.sort_values("Timestamp").iloc[-1]["ML_Signal"])
+    else:
+        latest_signal = 0
 
     # 8. Write CSV (with optional history freeze)
     csv_path = out_path(slug)
@@ -187,7 +200,6 @@ def process_target(target: dict) -> None:
         new_df.to_csv(csv_path, index=False)
 
     # 9. Execute trade on latest signal (quality gate + 2-bar persistence filter)
-    latest_signal = int(new_df.sort_values("Timestamp").iloc[-1]["ML_Signal"])
     _edge = metrics['precision'] - metrics['baseline_rate']
     signal_label  = "BUY" if latest_signal == 1 else "SELL/FLAT"
     trigger       = "TRIGGERED" if latest_proba > PROB_THRESHOLD else "below"
@@ -198,6 +210,13 @@ def process_target(target: dict) -> None:
         buf.append(latest_signal)
         if len(buf) >= 2 and len(set(buf)) == 1:
             execute_trade(symbol, latest_signal, avg_sl_val)
+        else:
+            reason = (
+                f"persistence waiting ({len(buf)}/2 bars, buf={list(buf)})"
+                if len(buf) < 2 or len(set(buf)) != 1
+                else "execute_trade: no signal transition"
+            )
+            print(f"[{symbol}] trade HELD — {reason}")
 
     return None
 

@@ -162,6 +162,28 @@ def run_diagnostics(target: dict) -> None:
     in_session = _in_session(TRADE_SESSIONS)
     brt_now   = datetime.now(_BRT).strftime("%H:%M")
 
+    # ── 7. Hidden gates (not shown in original table) ─────────────────────────
+    # 2-bar persistence: previous bar must carry the same signal
+    if len(tail_feats) >= 2:
+        prev_bar_signal = 1 if float(tail_proba[-2]) > PROB_THRESHOLD else 0
+    elif len(tail_feats) == 1:
+        prev_bar_signal = 1 if float(proba_train[-1]) > PROB_THRESHOLD else 0
+    elif len(proba_train) >= 2:
+        prev_bar_signal = 1 if float(proba_train[-2]) > PROB_THRESHOLD else 0
+    else:
+        prev_bar_signal = latest_signal  # insufficient history; assume consistent
+    persistence_ok = (prev_bar_signal == latest_signal)
+
+    # Signal transition: execute_trade skips if signal == last executed signal
+    # Infer last executed signal from any open position tagged with MAGIC_NUMBER
+    open_positions = mt5.positions_get(symbol=symbol) or []
+    last_exec_signal = -1
+    for pos in open_positions:
+        if pos.magic == MAGIC_NUMBER:
+            last_exec_signal = 1 if pos.type == mt5.ORDER_TYPE_BUY else 0
+            break
+    transition_ok = (latest_signal != last_exec_signal)
+
     # ── Print table ────────────────────────────────────────────────────────────
     print(f"\n{'PARAMETER':<35} {'REQUIRED / CONFIG':<22} {'CURRENT VALUE':<18} STATUS")
     print(SEP)
@@ -188,13 +210,32 @@ def run_diagnostics(target: dict) -> None:
     # -- Trade enabled
     print(f"  {'TRADE_ENABLED':<33} {'True':<22} {str(TRADE_ENABLED):<18} {_pass_fail(TRADE_ENABLED)}")
 
+    # -- 2-bar persistence filter
+    prev_label = "BUY" if prev_bar_signal == 1 else "SELL/FLAT"
+    print(f"  {'2-bar persistence (prev bar)':<33} {'prev==current':<22} {prev_label:<18} {_pass_fail(persistence_ok)}")
+
+    # -- Signal transition guard
+    last_exec_label = "BUY" if last_exec_signal == 1 else ("SELL/FLAT" if last_exec_signal == 0 else "none (no pos)")
+    print(f"  {'Signal transition':<33} {'current!=last exec':<22} {last_exec_label:<18} {_pass_fail(transition_ok)}")
+
     print(SEP)
 
     # ── Signal & order summary ────────────────────────────────────────────────
     all_gates = (latest_proba > PROB_THRESHOLD and precision >= 0.505
-                 and edge >= 0.02 and in_session and TRADE_ENABLED)
+                 and edge >= 0.02 and in_session and TRADE_ENABLED
+                 and persistence_ok and transition_ok)
     print(f"\n  Current signal     : {signal_label}")
     print(f"  All gates pass     : {_pass_fail(all_gates)}")
+    if not all_gates:
+        blockers = []
+        if not (latest_proba > PROB_THRESHOLD): blockers.append("proba below threshold")
+        if not (precision >= 0.505):            blockers.append("precision too low")
+        if not (edge >= 0.02):                  blockers.append("edge too low")
+        if not in_session:                      blockers.append("outside trade session")
+        if not TRADE_ENABLED:                   blockers.append("TRADE_ENABLED=False")
+        if not persistence_ok:                  blockers.append("2-bar persistence: prev bar signal differs")
+        if not transition_ok:                   blockers.append(f"signal transition: already in {last_exec_label} position")
+        print(f"  Blocked by         : {'; '.join(blockers)}")
     print(f"  → Order would be   : {'SENT (' + signal_label + ')' if all_gates else 'BLOCKED'}")
 
     # ── Supporting info ───────────────────────────────────────────────────────
