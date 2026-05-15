@@ -116,18 +116,23 @@ def compute_sl_points(
     max_bars: int,
 ) -> pd.Series:
     """
-    Fixed SL distance = median ATR(14) × sl_mult over the full lookback.
-    Assigned only to signal-transition bars; all other bars get 0.
+    ATR-normalised SL: at every signal-transition bar the SL distance is
+    atr14[i] * sl_mult (current-bar volatility), rounded to the nearest integer.
+    All non-transition bars receive 0.
+    Falls back to the recent 20-bar median ATR if the current bar's ATR is missing or zero.
     """
-    atr_full = atr14.reindex(signal_series.index).values
-    fixed_sl = float(np.nanmedian(atr_full) * sl_mult) if np.any(~np.isnan(atr_full)) else 0.0
+    atr_vals = atr14.reindex(signal_series.index).values
+    sig      = signal_series.values
+    n        = len(sig)
+    sl       = np.zeros(n, dtype=float)
 
-    sig = signal_series.values
-    n   = len(sig)
-    sl  = np.zeros(n, dtype=float)
     for i in range(1, n):
         prev, curr = int(sig[i - 1]), int(sig[i])
         if (curr == 1 and prev == 0) or (curr == 0 and prev == 1):
-            sl[i] = fixed_sl
+            bar_atr = atr_vals[i]
+            if np.isnan(bar_atr) or bar_atr <= 0:
+                # fall back to recent median of prior bars (exclude current bad bar)
+                bar_atr = float(np.nanmedian(atr_vals[max(0, i - 20):i]))
+            sl[i] = bar_atr * sl_mult
 
     return pd.Series(np.round(sl, 0).astype(int), index=signal_series.index, name='SL_Points')

@@ -182,7 +182,7 @@ def make_htf_features(symbol: str, bars_m5: pd.DataFrame) -> pd.DataFrame:
     htf['h1_atr_norm']   = _atr(df, 14) / df['Close'].replace(0, np.nan)
     htf['h1_body_ratio'] = (df['Close'] - df['Open']) / \
                             (df['High'] - df['Low']).replace(0, np.nan)
-    return htf.reindex(bars_m5.index, method='ffill')
+    return htf.shift(1).reindex(bars_m5.index, method='ffill')
 
 
 # ── Microstructure feature loaders ───────────────────────────────────────────

@@ -24,10 +24,16 @@ TB_PT_MULT        = 1.5          # profit target = 1.5 × ATR(14)
 TB_SL_MULT        = 1.2          # stop loss    = 1.2 × ATR(14)  (widened to survive noise)
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-PROB_THRESHOLD    = 0.54         # raised from 0.50; 0.57 was too strict for balanced-class LightGBM
+PROB_THRESHOLD    = 0.57         # raised from 0.54 — tighter entry filter; prior comment noting
+                                  # '0.57 was too strict' reflected an earlier, less-filtered model
+MIN_PRECISION     = 0.52         # raised from 0.505 — require meaningful precision edge
+MIN_EDGE          = 0.04         # raised from 0.02  — require meaningful lift over baseline
 INTERVAL_SECONDS  = 60
 N_SPLITS_CV       = 5
 RECENCY_DECAY     = 1.2          # lowered from 2.0 — reduces oversensitivity to single volatile bars
+
+# ── Cooldown after stop-out ───────────────────────────────────────────────────
+COOLDOWN_BARS     = 5            # bars to skip re-entry after a stop-out transition
 
 # ── Microstructure ────────────────────────────────────────────────────────────
 DOM_LEVELS            = 5     # top-N book levels to aggregate
