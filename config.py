@@ -28,12 +28,13 @@ PROB_THRESHOLD    = 0.57         # raised from 0.54 — tighter entry filter; pr
                                   # '0.57 was too strict' reflected an earlier, less-filtered model
 MIN_PRECISION     = 0.52         # raised from 0.505 — require meaningful precision edge
 MIN_EDGE          = 0.04         # raised from 0.02  — require meaningful lift over baseline
+DAILY_MAX_LOSS    = -400         # stop new entries when realized day P&L drops below this (BRT)
 INTERVAL_SECONDS  = 60
 N_SPLITS_CV       = 5
 RECENCY_DECAY     = 1.2          # lowered from 2.0 — reduces oversensitivity to single volatile bars
 
 # ── Cooldown after stop-out ───────────────────────────────────────────────────
-COOLDOWN_BARS     = 5            # bars to skip re-entry after a stop-out transition
+COOLDOWN_BARS     = 12           # bars to skip re-entry after a stop-out transition (raised from 5 → 60 min buffer)
 
 # ── Microstructure ────────────────────────────────────────────────────────────
 DOM_LEVELS            = 5     # top-N book levels to aggregate
@@ -72,7 +73,7 @@ MAGIC_NUMBER       = 20260507  # unique tag for orders placed by this script
 TRAIL_ACTIVATE_PCT = 0.50   # activate trailing stop when profit >= 50% of SL distance
 
 # ── Grid (Fibonacci martingale) ───────────────────────────────────────────────
-GRID_ENABLED           = True   # add Fibonacci-scaled orders when a position is in loss
+GRID_ENABLED           = False  # disabled — grid amplifies losses during whipsaw conditions
 GRID_MAX_LEVELS        = 5      # maximum grid add-ons per seed position
 GRID_STEP_MULT         = 0.80   # grid step = GRID_STEP_MULT × SL-distance in adverse direction
                                  # raised from 0.30 — less aggressive averaging-down

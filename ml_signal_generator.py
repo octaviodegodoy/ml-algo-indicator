@@ -32,7 +32,7 @@ from config import (
     TB_MAX_BARS, TB_PT_MULT, TB_SL_MULT,
     PROB_THRESHOLD, N_SPLITS_CV, MIN_MICRO_ROWS,
     FREEZE_HISTORY, TRADE_ENABLED, TRADE_SESSIONS, out_path,
-    MIN_PRECISION, MIN_EDGE, COOLDOWN_BARS,
+    MIN_PRECISION, MIN_EDGE, COOLDOWN_BARS, DAILY_MAX_LOSS,
 )
 from mt5_client import (
     mt5_setup, fetch_bars, append_dom_snapshot, fetch_and_aggregate_ticks,
@@ -53,6 +53,21 @@ _signal_buffer: dict = {}    # symbol → deque(maxlen=2)
 _cooldown_counter: dict = {} # symbol → int (bars remaining before re-entry allowed)
 
 _BRT = timezone(timedelta(hours=-3))
+
+
+# ── Daily P&L helper ─────────────────────────────────────────────────────────
+def _get_daily_pnl() -> float:
+    """Return today's realized P&L from MT5 deal history (BRT day boundary)."""
+    try:
+        today     = datetime.now(_BRT).replace(hour=0, minute=0, second=0, microsecond=0)
+        today_utc = today.astimezone(timezone.utc)
+        now_utc   = datetime.now(timezone.utc)
+        deals     = mt5.history_deals_get(today_utc, now_utc)
+        if not deals:
+            return 0.0
+        return sum(d.profit for d in deals if d.entry == 1)
+    except Exception:
+        return 0.0
 
 
 def _in_trade_session() -> bool:
@@ -205,9 +220,13 @@ def process_target(target: dict) -> None:
     _edge = metrics['precision'] - metrics['baseline_rate']
     signal_label  = "BUY" if latest_signal == 1 else "SELL/FLAT"
     trigger       = "TRIGGERED" if latest_proba > PROB_THRESHOLD else "below"
-    print(f"[{symbol}] signal={signal_label}  proba={latest_proba:.3f} {'>' if latest_proba > PROB_THRESHOLD else '<'} threshold={PROB_THRESHOLD}  ({trigger})  edge={_edge:+.3f}  prec={metrics['precision']:.3f}  sl={avg_sl_val}p")
-    # Quality gate: precision and edge must exceed raised thresholds to avoid near-random entries
-    if metrics['precision'] >= MIN_PRECISION and _edge >= MIN_EDGE and _in_trade_session():
+    # Volatility gate: skip entry when current ATR > 2× the 20-bar ATR median (choppy/gapping bar)
+    _atr_median  = float(np.nanmedian(atr14.iloc[-20:].values))
+    _atr_current = float(atr14.iloc[-1]) if not np.isnan(float(atr14.iloc[-1])) else _atr_median
+    _high_vol    = _atr_current > 2.0 * _atr_median if _atr_median > 0 else False
+    print(f"[{symbol}] signal={signal_label}  proba={latest_proba:.3f} {'>' if latest_proba > PROB_THRESHOLD else '<'} threshold={PROB_THRESHOLD}  ({trigger})  edge={_edge:+.3f}  prec={metrics['precision']:.3f}  sl={avg_sl_val}p  atr={_atr_current:.0f}{'  [HIGH-VOL GATE]' if _high_vol else ''}")
+    # Quality gate: precision, edge, session, and volatility must all pass
+    if metrics['precision'] >= MIN_PRECISION and _edge >= MIN_EDGE and _in_trade_session() and not _high_vol:
         buf = _signal_buffer.setdefault(symbol, deque(maxlen=2))
         buf.append(latest_signal)
         _cooldown = _cooldown_counter.get(symbol, 0)
@@ -234,6 +253,11 @@ def process_target(target: dict) -> None:
 # ── Main loop ─────────────────────────────────────────────────────────────────
 def run_once() -> None:
     now = pd.Timestamp.now().strftime("%H:%M:%S")
+    # Daily loss circuit breaker — halt new entries for the rest of the day
+    daily_pnl = _get_daily_pnl()
+    if daily_pnl <= DAILY_MAX_LOSS:
+        print(f"[{now}] Daily loss circuit breaker: P&L={daily_pnl:.2f} ≤ {DAILY_MAX_LOSS}. No new entries today.")
+        return
     for t in TARGETS:
         try:
             process_target(t)
