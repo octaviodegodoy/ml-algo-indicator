@@ -174,6 +174,8 @@ def execute_trade(symbol: str, current_signal: int, sl_price_units: float) -> No
     if strategy_positions:
         if _close_symbol_position(symbol):
             print(f"  [trade] seed order deferred for {symbol}: existing positions were closed; waiting for flat re-entry")
+        else:
+            print(f"  [trade] seed order deferred for {symbol}: failed to close all existing positions")
         return
 
     if current_signal == 1:   # ── BUY ─────────────────────────────────────────
@@ -206,7 +208,6 @@ def execute_trade(symbol: str, current_signal: int, sl_price_units: float) -> No
 
     elif current_signal == 0:  # ── SELL / EXIT ───────────────────────────────
         if not TRADE_BOTH_SIDES:
-            _last_exec_signal[symbol] = current_signal
             return
         lot    = _get_lot_size(symbol, sl_price_units)
         price  = tick.bid
