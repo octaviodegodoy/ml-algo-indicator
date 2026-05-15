@@ -32,6 +32,7 @@ from config import (
     TB_MAX_BARS, TB_PT_MULT, TB_SL_MULT,
     PROB_THRESHOLD, N_SPLITS_CV, MIN_MICRO_ROWS,
     FREEZE_HISTORY, TRADE_ENABLED, TRADE_SESSIONS, out_path,
+    MIN_PRECISION, MIN_EDGE, COOLDOWN_BARS,
 )
 from mt5_client import (
     mt5_setup, fetch_bars, append_dom_snapshot, fetch_and_aggregate_ticks,
@@ -48,7 +49,8 @@ from trade import execute_trade, manage_trailing_stops, manage_grid_orders, init
 
 
 # ── Signal persistence buffer (per symbol, last 2 evaluations) ───────────────
-_signal_buffer: dict = {}   # symbol → deque(maxlen=2)
+_signal_buffer: dict = {}    # symbol → deque(maxlen=2)
+_cooldown_counter: dict = {} # symbol → int (bars remaining before re-entry allowed)
 
 _BRT = timezone(timedelta(hours=-3))
 
@@ -110,7 +112,7 @@ def process_target(target: dict) -> None:
 
     # 6. Train
     rec_weights = compute_recency_weights(len(aligned))
-    metrics     = evaluate_walkforward(X, y, N_SPLITS_CV, embargo=TB_MAX_BARS,
+    metrics     = evaluate_walkforward(X, y, N_SPLITS_CV, embargo=TB_MAX_BARS + 1,
                                        weights=rec_weights)
 
     model = Pipeline([
@@ -204,12 +206,20 @@ def process_target(target: dict) -> None:
     signal_label  = "BUY" if latest_signal == 1 else "SELL/FLAT"
     trigger       = "TRIGGERED" if latest_proba > PROB_THRESHOLD else "below"
     print(f"[{symbol}] signal={signal_label}  proba={latest_proba:.3f} {'>' if latest_proba > PROB_THRESHOLD else '<'} threshold={PROB_THRESHOLD}  ({trigger})  edge={_edge:+.3f}  prec={metrics['precision']:.3f}  sl={avg_sl_val}p")
-    # Quality gate: precision floor is 0.505 (barely above random); edge check is the main guard
-    if metrics['precision'] >= 0.505 and _edge >= 0.02 and _in_trade_session():
+    # Quality gate: precision and edge must exceed raised thresholds to avoid near-random entries
+    if metrics['precision'] >= MIN_PRECISION and _edge >= MIN_EDGE and _in_trade_session():
         buf = _signal_buffer.setdefault(symbol, deque(maxlen=2))
         buf.append(latest_signal)
-        if len(buf) >= 2 and len(set(buf)) == 1:
+        _cooldown = _cooldown_counter.get(symbol, 0)
+        if _cooldown > 0:
+            _cooldown_counter[symbol] = _cooldown - 1
+            print(f"[{symbol}] trade HELD — cooldown ({_cooldown - 1} bars remaining)")
+        elif len(buf) >= 2 and len(set(buf)) == 1:
             execute_trade(symbol, latest_signal, avg_sl_val)
+            # Reset cooldown on flat signal (signal=0 means close long / go flat)
+            # so the next long entry waits COOLDOWN_BARS bars before re-entering
+            if latest_signal == 0:
+                _cooldown_counter[symbol] = COOLDOWN_BARS
         else:
             reason = (
                 f"persistence waiting ({len(buf)}/2 bars, buf={list(buf)})"
