@@ -163,15 +163,22 @@ def execute_trade(symbol: str, current_signal: int, sl_price_units: float) -> No
     if current_signal == prev_signal:
         return
 
-    _last_exec_signal[symbol] = current_signal
     tick = mt5.symbol_info_tick(symbol)
     info = mt5.symbol_info(symbol)
     if tick is None or info is None:
         print(f"  [trade] symbol info unavailable for {symbol}")
         return
 
+    open_positions = mt5.positions_get(symbol=symbol) or []
+    strategy_positions = [p for p in open_positions if p.magic == MAGIC_NUMBER]
+    if strategy_positions:
+        if _close_symbol_position(symbol):
+            print(f"  [trade] seed order deferred for {symbol}: existing positions were closed; waiting for flat re-entry")
+        else:
+            print(f"  [trade] seed order deferred for {symbol}: failed to close all existing positions")
+        return
+
     if current_signal == 1:   # ── BUY ─────────────────────────────────────────
-        _close_symbol_position(symbol)
         lot    = _get_lot_size(symbol, sl_price_units)
         price  = tick.ask
         sl_raw = price - sl_price_units
@@ -196,10 +203,10 @@ def execute_trade(symbol: str, current_signal: int, sl_price_units: float) -> No
             err = result.retcode if result else mt5.last_error()
             print(f"  [trade] BUY failed: retcode={err}  price={price}  SL={sl}")
         else:
+            _last_exec_signal[symbol] = current_signal
             print(f"  [trade] BUY  {lot} lots {symbol} @ {price:.{info.digits}f}  SL={sl:.{info.digits}f}  no-TP")
 
     elif current_signal == 0:  # ── SELL / EXIT ───────────────────────────────
-        _close_symbol_position(symbol)
         if not TRADE_BOTH_SIDES:
             return
         lot    = _get_lot_size(symbol, sl_price_units)
@@ -226,6 +233,7 @@ def execute_trade(symbol: str, current_signal: int, sl_price_units: float) -> No
             err = result.retcode if result else mt5.last_error()
             print(f"  [trade] SELL failed: retcode={err}  price={price}  SL={sl}")
         else:
+            _last_exec_signal[symbol] = current_signal
             print(f"  [trade] SELL {lot} lots {symbol} @ {price:.{info.digits}f}  SL={sl:.{info.digits}f}  no-TP")
 
 
