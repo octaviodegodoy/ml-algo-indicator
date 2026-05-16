@@ -42,7 +42,7 @@ from mt5_client import fetch_bars, mt5_setup
 # ── Simulation constants ──────────────────────────────────────────────────────
 SYMBOL       = "WINM26"
 TIMEFRAME    = mt5.TIMEFRAME_M5
-N_TRAIN_BARS = 5000
+N_TRAIN_BARS = 7500
 LOTS         = 5       # fixed 1 mini lot per trade for a fair comparison
 TICK_VALUE   = 0.20    # R$ per point per mini lot (WINM26 standard)
 COMMISSION   = LOTS * 2.0  # R$ per round trip (1 × entry + 1 × exit fee)
@@ -71,6 +71,15 @@ PARAMS = {
     ),
     "NEW": dict(
         prob_threshold   = 0.54,
+        recency_decay    = 1.2,
+        sl_mult          = 1.2,
+        pt_mult          = 1.5,
+        max_bars         = 12,
+        use_persistence  = True,
+        use_quality_gate = True,
+    ),
+    "THRESHOLD_060": dict(
+        prob_threshold   = 0.60,
         recency_decay    = 1.2,
         sl_mult          = 1.2,
         pt_mult          = 1.5,

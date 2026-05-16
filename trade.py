@@ -51,11 +51,26 @@ def _get_lot_size(symbol: str, sl_price_units: float) -> float:
     tick_value          = info.trade_tick_value if info.trade_tick_value > 0 else 0.20
     point_value_per_lot = tick_value / tick_size
     risk_amount         = account.balance * RISK_PCT / 100.0
-    raw_lot             = risk_amount / (sl_price_units * point_value_per_lot)
+    raw_lot             = risk_amount / (sl_price_units * point_value_per_lot) / _grid_divisor()
     step                = info.volume_step if info.volume_step > 0 else 0.01
     lot                 = round(raw_lot / step) * step
     lot                 = max(info.volume_min, min(info.volume_max, lot))
     return round(lot, 2)
+
+
+def _grid_divisor() -> float:
+    """
+    When the grid is enabled the seed lot is divided by this factor so that the
+    cumulative volume across seed + all grid levels never exceeds the full
+    RISK_PCT budget.
+
+    divisor = 1 (seed) + Σ Fibonacci(level) for level in 1..GRID_MAX_LEVELS
+    Example with GRID_MAX_LEVELS=5: 1 + 1+1+2+3+5 = 13
+    """
+    if not GRID_ENABLED:
+        return 1.0
+    fib_sum = sum(_FIB[min(i, len(_FIB) - 1)] for i in range(GRID_MAX_LEVELS))
+    return float(1 + fib_sum)
 
 
 def _fib_lot(base_lot: float, level: int, info) -> float:
@@ -315,17 +330,14 @@ def _portfolio_stop_loss(symbol: str, all_positions: list, seed, info) -> bool:
     if total_profit >= 0:
         return False  # in profit or flat — nothing to do
 
-    sl_dist = abs(seed.price_open - seed.sl)
-    if sl_dist <= 0:
+    account = mt5.account_info()
+    if account is None:
         return False
 
-    tick_size           = info.trade_tick_size  if info.trade_tick_size  > 0 else info.point
-    tick_value          = info.trade_tick_value if info.trade_tick_value > 0 else 0.20
-    point_value_per_lot = tick_value / tick_size
-
-    # Monetary value of one full seed SL hit (at seed lot size)
-    seed_sl_value = sl_dist * point_value_per_lot * seed.volume
-    max_loss      = GRID_PORTFOLIO_SL_MULT * seed_sl_value
+    # Total grid loss cap: GRID_PORTFOLIO_SL_MULT × full RISK_PCT budget.
+    # Using the balance-relative budget (rather than seed lot size) keeps the
+    # threshold stable now that the seed is sized as 1/grid_divisor of RISK_PCT.
+    max_loss = GRID_PORTFOLIO_SL_MULT * account.balance * RISK_PCT / 100.0
 
     if abs(total_profit) >= max_loss:
         print(

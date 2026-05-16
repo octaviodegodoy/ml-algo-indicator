@@ -67,11 +67,30 @@ def make_features(df: pd.DataFrame, prefix: str = '') -> pd.DataFrame:
     return out
 
 
+def _third_wednesday(year: int, month: int) -> pd.Timestamp:
+    """Third Wednesday of the given month (WIN futures monthly expiry)."""
+    first_day = pd.Timestamp(year=year, month=month, day=1)
+    days_to_wed = (2 - first_day.weekday()) % 7          # Wednesday = weekday 2
+    return first_day + pd.Timedelta(days=days_to_wed) + pd.Timedelta(weeks=2)
+
+
 def add_time_features(out: pd.DataFrame) -> pd.DataFrame:
     minutes        = out.index.hour * 60 + out.index.minute
     out['tod_sin'] = np.sin(2 * np.pi * minutes / (24 * 60))
     out['tod_cos'] = np.cos(2 * np.pi * minutes / (24 * 60))
     out['dow']     = out.index.dayofweek
+
+    # Days to next WIN monthly expiry (third Wednesday) ─ normalised to [0,1]
+    def _dte(ts: pd.Timestamp) -> int:
+        expiry = _third_wednesday(ts.year, ts.month)
+        if ts.date() >= expiry.date():
+            nxt_month = ts.month % 12 + 1
+            nxt_year  = ts.year + (1 if ts.month == 12 else 0)
+            expiry    = _third_wednesday(nxt_year, nxt_month)
+        return (expiry.date() - ts.date()).days
+
+    dte_raw               = np.array([_dte(ts) for ts in out.index], dtype=float)
+    out['days_to_expiry'] = dte_raw / 21.0   # ≈ max trading days in a monthly cycle
     return out
 
 

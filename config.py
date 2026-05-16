@@ -16,7 +16,7 @@ TARGETS = [
 # ── Bar / timeframe ───────────────────────────────────────────────────────────
 TIMEFRAME         = mt5.TIMEFRAME_M5
 TF_SECONDS        = 5 * 60
-N_BARS            = 5000
+N_BARS            = 7500
 
 # ── Triple-barrier params (in ATR multiples) ──────────────────────────────────
 TB_MAX_BARS       = 12           # vertical barrier: ~1 hour on M5
@@ -47,14 +47,9 @@ HTF_BARS              = 500   # H1 bars to fetch for higher-timeframe context
 # ── Trading session filter (BRT = UTC-3) ─────────────────────────────────────
 # B3 WIN liquidity profile:
 #   09:00-09:05  opening auction            → avoid (thin, volatile)
-#   09:05-12:00  morning session            → liquid  ✓
-#   12:00-13:30  lunch/dead zone            → avoid (wide spreads)
-#   13:30-17:55  afternoon + US-open window → liquid  ✓  (peak 14:30-16:00)
-#   17:55-18:00  close / final auction      → avoid
-# Times are (hour, minute) tuples in BRT (UTC-3). Python datetime.now(tz) for BRT.
+#   09:05-13:00  day → liquid  ✓
 TRADE_SESSIONS = [
-    ((9,  5), (12,  0)),   # morning session
-    ((13, 30), (17, 55)),  # afternoon session
+    ((9,  5), (13,  0)),   # morning session
 ]
 
 # ── Signal freeze ─────────────────────────────────────────────────────────────
@@ -73,7 +68,7 @@ MAGIC_NUMBER       = 20260507  # unique tag for orders placed by this script
 TRAIL_ACTIVATE_PCT = 0.50   # activate trailing stop when profit >= 50% of SL distance
 
 # ── Grid (Fibonacci martingale) ───────────────────────────────────────────────
-GRID_ENABLED           = False  # disabled — grid amplifies losses during whipsaw conditions
+GRID_ENABLED           = True   # seed + grid total volume capped to RISK_PCT budget via _grid_divisor()
 GRID_MAX_LEVELS        = 5      # maximum grid add-ons per seed position
 GRID_STEP_MULT         = 0.80   # grid step = GRID_STEP_MULT × SL-distance in adverse direction
                                  # raised from 0.30 — less aggressive averaging-down
