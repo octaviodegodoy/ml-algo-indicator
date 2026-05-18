@@ -22,6 +22,10 @@ import os
 import sys
 from collections import deque
 
+# Force UTF-8 output so box-drawing chars don't crash on Windows cp1252 consoles
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import MetaTrader5 as mt5
