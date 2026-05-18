@@ -38,11 +38,16 @@ from model import (
     triple_barrier_labels,
 )
 from mt5_client import fetch_bars, mt5_setup
+from config import (
+    N_BARS, PROB_THRESHOLD, RECENCY_DECAY,
+    TB_SL_MULT, TB_PT_MULT, TB_MAX_BARS,
+    MIN_AUC, TRADE_SESSIONS,
+)
 
 # ── Simulation constants ──────────────────────────────────────────────────────
 SYMBOL       = "WINM26"
 TIMEFRAME    = mt5.TIMEFRAME_M5
-N_TRAIN_BARS = 7500
+N_TRAIN_BARS = N_BARS
 LOTS         = 5       # fixed 1 mini lot per trade for a fair comparison
 TICK_VALUE   = 0.20    # R$ per point per mini lot (WINM26 standard)
 COMMISSION   = LOTS * 2.0  # R$ per round trip (1 × entry + 1 × exit fee)
@@ -70,20 +75,20 @@ PARAMS = {
         use_quality_gate = False,
     ),
     "NEW": dict(
-        prob_threshold   = 0.54,
-        recency_decay    = 1.2,
-        sl_mult          = 1.2,
-        pt_mult          = 1.5,
-        max_bars         = 12,
+        prob_threshold   = PROB_THRESHOLD,   # from config.py
+        recency_decay    = RECENCY_DECAY,    # from config.py
+        sl_mult          = TB_SL_MULT,       # from config.py
+        pt_mult          = TB_PT_MULT,       # from config.py
+        max_bars         = TB_MAX_BARS,      # from config.py
         use_persistence  = True,
         use_quality_gate = True,
     ),
     "THRESHOLD_060": dict(
         prob_threshold   = 0.60,
-        recency_decay    = 1.2,
-        sl_mult          = 1.2,
-        pt_mult          = 1.5,
-        max_bars         = 12,
+        recency_decay    = RECENCY_DECAY,
+        sl_mult          = TB_SL_MULT,
+        pt_mult          = TB_PT_MULT,
+        max_bars         = TB_MAX_BARS,
         use_persistence  = True,
         use_quality_gate = True,
     ),
@@ -121,11 +126,13 @@ def train_and_score(bars_train: pd.DataFrame, bars_test: pd.DataFrame, p: dict):
         X_train, y_train, N_SPLITS_CV, embargo=EMBARGO, weights=weights
     )
     edge = metrics["precision"] - metrics["baseline_rate"]
+    auc  = metrics.get("roc_auc", 0.5)
 
-    if p["use_quality_gate"] and (metrics["precision"] < 0.505 or edge < 0.02):
+    if p["use_quality_gate"] and auc < MIN_AUC:
         print(
             f"    Quality gate would REJECT  "
-            f"prec={metrics['precision']:.3f}  edge={edge:+.3f}  (continuing for backtest visibility)"
+            f"auc={auc:.3f} < MIN_AUC={MIN_AUC}  prec={metrics['precision']:.3f}  "
+            f"(continuing for backtest visibility)"
         )
 
     model = Pipeline(
@@ -184,11 +191,23 @@ def train_and_score(bars_train: pd.DataFrame, bars_test: pd.DataFrame, p: dict):
 
 
 # ── P&L simulation ────────────────────────────────────────────────────────────
+def _in_session(ts) -> bool:
+    """Check if a UTC timestamp falls within TRADE_SESSIONS (BRT = UTC-3)."""
+    import pytz
+    brt = ts.tz_convert('America/Sao_Paulo') if ts.tzinfo else ts
+    t = (brt.hour, brt.minute)
+    for start, end in TRADE_SESSIONS:
+        if start <= t <= end:
+            return True
+    return False
+
+
 def simulate_pnl(bars_test: pd.DataFrame, signal_series: pd.Series, sl_mult: float):
     """
     Walk through today's bars and simulate trades.
     Entry / exit are at the close of the triggering bar (conservative).
     SL = sl_mult × ATR(14) computed from the test bars themselves.
+    Only opens new trades within TRADE_SESSIONS (mirrors live generator).
     Returns (trades_df, summary_dict).
     """
     atr_test = _atr(bars_test, 14)
@@ -246,7 +265,8 @@ def simulate_pnl(bars_test: pd.DataFrame, signal_series: pd.Series, sl_mult: flo
 
         # Open a trade whenever we have a confirmed signal and are flat
         # (retry every bar so NaN ATR at warm-up doesn't permanently block entry)
-        if not in_trade:
+        # Session gate: only open new entries within TRADE_SESSIONS
+        if not in_trade and _in_session(ts):
             atr_val = float(atr_test.get(ts, np.nan))
             if not np.isnan(c) and not np.isnan(atr_val) and atr_val > 0:
                 entry_price = c
