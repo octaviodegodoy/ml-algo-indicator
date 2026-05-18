@@ -16,7 +16,7 @@ TARGETS = [
 # ── Bar / timeframe ───────────────────────────────────────────────────────────
 TIMEFRAME         = mt5.TIMEFRAME_M5
 TF_SECONDS        = 5 * 60
-N_BARS            = 7500
+N_BARS            = 15000
 
 # ── Triple-barrier params (in ATR multiples) ──────────────────────────────────
 TB_MAX_BARS       = 12           # vertical barrier: ~1 hour on M5
