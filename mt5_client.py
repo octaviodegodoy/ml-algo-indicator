@@ -22,6 +22,9 @@ _dom_thread_stop:   threading.Event            = threading.Event()
 # Tracks which DOM CSV paths have already been schema-validated this session
 _dom_schema_validated: set = set()
 
+# Lock serialising all DOM CSV writes to prevent duplicate header rows
+_dom_csv_lock = threading.Lock()
+
 # Symbols for which the broker does not provide tick history (detected at startup)
 _no_tick_symbols: set = set()
 
@@ -216,8 +219,9 @@ def append_dom_snapshot(symbol: str, slug: str) -> bool:
     if snap is None:
         return False
     path = dom_path(slug)
-    _ensure_dom_schema(path, snap)
-    pd.DataFrame([snap]).to_csv(path, mode='a', header=not os.path.exists(path), index=False)
+    with _dom_csv_lock:
+        _ensure_dom_schema(path, snap)
+        pd.DataFrame([snap]).to_csv(path, mode='a', header=not os.path.exists(path), index=False)
     return True
 
 
@@ -234,10 +238,11 @@ def _dom_sampling_thread() -> None:
                 continue
             path = dom_path(slug)
             try:
-                _ensure_dom_schema(path, snap)
-                pd.DataFrame([snap]).to_csv(
-                    path, mode='a', header=not os.path.exists(path), index=False
-                )
+                with _dom_csv_lock:
+                    _ensure_dom_schema(path, snap)
+                    pd.DataFrame([snap]).to_csv(
+                        path, mode='a', header=not os.path.exists(path), index=False
+                    )
             except Exception:
                 pass
         _dom_thread_stop.wait(timeout=DOM_SAMPLE_SECS)

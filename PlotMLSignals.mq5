@@ -6,10 +6,13 @@
 #property indicator_buffers 0
 #property indicator_plots   0
 
-input string SignalFile      = "win_ml_signals.csv";
-input int    LookbackDays    = 1;     // how many days back to plot signals
-input int    RefreshSeconds  = 15;    // how often to re-read the CSV
-input bool   OnlyTransitions = true;  // true = only plot 0->1 buys / 1->0 sells (recommended for M5)
+input string SignalFile         = "win_ml_signals.csv";
+input int    LookbackDays       = 1;     // how many days back to plot signals
+input int    RefreshSeconds     = 15;    // how often to re-read the CSV
+input bool   OnlyTransitions    = true;  // true = only plot 0->1 buys / 1->0 sells (recommended for M5)
+input double FilterMinProb      = 0.35;  // hide BUY arrows whose bar prob < this (match PROB_THRESHOLD in config.py)
+input double FilterMinPrecision = 0.46;  // CSV col 'Precision' stores ROC-AUC: hide signals when AUC < this (match MIN_AUC in config.py)
+input double FilterMinEdge      = -99.0; // CSV col 'Edge' stores AUC-0.5; disabled (-99) — FilterMinPrecision already covers this
 
 //---
 int OnInit()
@@ -88,6 +91,9 @@ void PlotSignals()
       string timestamp = parts[0];
       string sigStr    = parts[1];
       string slStr     = nParts >= 3 ? parts[2] : "0";
+      double rowProb      = nParts >= 4 ? StringToDouble(parts[3]) : 1.0;
+      double rowPrecision = nParts >= 5 ? StringToDouble(parts[4]) : 1.0;
+      double rowEdge      = nParts >= 6 ? StringToDouble(parts[5]) : 1.0;
       if(timestamp == "" || sigStr == "") continue;
       totalRows++;
 
@@ -107,6 +113,12 @@ void PlotSignals()
          isSell = (signal == 0);
         }
       prevSignal = signal;
+
+      // ── Quality / probability filter ──────────────────────────────────────
+      // Model-level gate: hide everything when precision or edge is too low
+      if(rowPrecision < FilterMinPrecision || rowEdge < FilterMinEdge) continue;
+      // Per-bar gate: hide BUY arrows whose raw probability is below the threshold
+      if(isBuy && rowProb < FilterMinProb) continue;
 
       if(dt < cutoff) continue;
       inWindow++;

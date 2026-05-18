@@ -210,6 +210,8 @@ def load_dom_features(slug: str) -> pd.DataFrame:
     if not os.path.exists(path):
         return pd.DataFrame()
     df = pd.read_csv(path, on_bad_lines='skip')
+    df['ts'] = pd.to_numeric(df['ts'], errors='coerce')
+    df = df.dropna(subset=['ts'])
     df['ts']  = pd.to_datetime(df['ts'], unit='s', utc=True)
     df['bar'] = df['ts'].dt.floor(f'{TF_SECONDS}s')
     # Backfill columns added after initial data collection (old CSVs may lack them)
@@ -260,7 +262,9 @@ def load_tick_features(slug: str) -> pd.DataFrame:
     path = ticks_path(slug)
     if not os.path.exists(path):
         return pd.DataFrame()
-    df = pd.read_csv(path)
+    df = pd.read_csv(path, on_bad_lines='skip')
+    df['ts'] = pd.to_numeric(df['ts'], errors='coerce')
+    df = df.dropna(subset=['ts'])
     df['bar'] = pd.to_datetime(df['ts'], unit='s', utc=True)
     df = df.drop(columns=['ts'])
     g = df.groupby('bar').agg(

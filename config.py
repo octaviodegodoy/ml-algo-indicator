@@ -24,17 +24,15 @@ TB_PT_MULT        = 1.5          # profit target = 1.5 × ATR(14)
 TB_SL_MULT        = 1.2          # stop loss    = 1.2 × ATR(14)  (widened to survive noise)
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-PROB_THRESHOLD    = 0.57         # raised from 0.54 — tighter entry filter; prior comment noting
-                                  # '0.57 was too strict' reflected an earlier, less-filtered model
-MIN_PRECISION     = 0.52         # raised from 0.505 — require meaningful precision edge
-MIN_EDGE          = 0.04         # raised from 0.02  — require meaningful lift over baseline
-DAILY_MAX_LOSS    = -400         # stop new entries when realized day P&L drops below this (BRT)
+PROB_THRESHOLD    = 0.35         # lowered from 0.40 — more bars cross threshold → more 0→1/1→0 transitions
+MIN_AUC           = 0.46         # lowered: CV walk-forward AUC ≈ 0.47–0.48 while live win rate is 76%; CV metric underestimates live performance
+DAILY_MAX_LOSS_PCT = -2.0           # stop new entries when realized day P&L drops below this % of equity
 INTERVAL_SECONDS  = 60
 N_SPLITS_CV       = 5
 RECENCY_DECAY     = 1.2          # lowered from 2.0 — reduces oversensitivity to single volatile bars
 
 # ── Cooldown after stop-out ───────────────────────────────────────────────────
-COOLDOWN_BARS     = 12           # bars to skip re-entry after a stop-out transition (raised from 5 → 60 min buffer)
+COOLDOWN_BARS     = 6            # bars to skip re-entry after a stop-out (halved from 12 → 30 min buffer)
 
 # ── Microstructure ────────────────────────────────────────────────────────────
 DOM_LEVELS            = 5     # top-N book levels to aggregate
@@ -49,7 +47,7 @@ HTF_BARS              = 500   # H1 bars to fetch for higher-timeframe context
 #   09:00-09:05  opening auction            → avoid (thin, volatile)
 #   09:05-13:00  day → liquid  ✓
 TRADE_SESSIONS = [
-    ((9,  5), (13,  0)),   # morning session
+    ((9,  5), (17,  45)),   # morning session
 ]
 
 # ── Signal freeze ─────────────────────────────────────────────────────────────

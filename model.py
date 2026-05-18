@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from lightgbm import LGBMClassifier
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import accuracy_score, precision_score, recall_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 
@@ -75,7 +75,7 @@ def evaluate_walkforward(
     weights: Optional[np.ndarray] = None,
 ) -> dict:
     tscv = TimeSeriesSplit(n_splits=n_splits)
-    accs, precs, recs = [], [], []
+    accs, precs, recs, aucs = [], [], [], []
 
     for train_idx, test_idx in tscv.split(X):
         if embargo > 0 and len(train_idx) > embargo:
@@ -91,18 +91,25 @@ def evaluate_walkforward(
                                    class_weight='balanced', random_state=42, verbosity=-1)),
         ])
         m.fit(Xtr, ytr, gb__sample_weight=sw)
-        pred = m.predict(Xte)
+        pred  = m.predict(Xte)
+        proba = m.predict_proba(Xte)[:, 1]
         accs.append(accuracy_score(yte, pred))
         precs.append(precision_score(yte, pred, zero_division=0))
         recs.append(recall_score(yte, pred, zero_division=0))
+        try:
+            aucs.append(roc_auc_score(yte, proba))
+        except Exception:
+            aucs.append(0.5)   # degenerate fold — treat as random
 
     if not accs:
         return {'accuracy': float('nan'), 'precision': float('nan'),
-                'recall': float('nan'), 'baseline_rate': float(y.mean())}
+                'recall': float('nan'), 'roc_auc': float('nan'),
+                'baseline_rate': float(y.mean())}
     return {
         'accuracy':      float(np.mean(accs)),
         'precision':     float(np.mean(precs)),
         'recall':        float(np.mean(recs)),
+        'roc_auc':       float(np.mean(aucs)),
         'baseline_rate': float(y.mean()),
     }
 

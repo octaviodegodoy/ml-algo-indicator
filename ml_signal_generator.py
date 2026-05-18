@@ -32,7 +32,7 @@ from config import (
     TB_MAX_BARS, TB_PT_MULT, TB_SL_MULT,
     PROB_THRESHOLD, N_SPLITS_CV, MIN_MICRO_ROWS,
     FREEZE_HISTORY, TRADE_ENABLED, TRADE_SESSIONS, out_path,
-    MIN_PRECISION, MIN_EDGE, COOLDOWN_BARS, DAILY_MAX_LOSS,
+    MIN_AUC, COOLDOWN_BARS, DAILY_MAX_LOSS_PCT,
 )
 from mt5_client import (
     mt5_setup, fetch_bars, append_dom_snapshot, fetch_and_aggregate_ticks,
@@ -147,10 +147,16 @@ def process_target(target: dict) -> None:
     _atr_last  = float(atr14.iloc[-1]) if not np.isnan(float(atr14.iloc[-1])) else float(np.nanmedian(atr14.values))
     avg_sl_val = int(round(_atr_last * TB_SL_MULT)) if _atr_last > 0 else 0
 
+    # Model quality metric: ROC-AUC from walk-forward CV (threshold-independent)
+    # Written to CSV columns so the indicator can filter low-quality model cycles.
+    # Precision col = roc_auc (0.50–1.0);  Edge col = roc_auc − 0.50 (lift over random)
+    _auc = round(metrics['roc_auc'], 4) if not np.isnan(metrics['roc_auc']) else 0.5
+
     new_df = pd.DataFrame({
         "Timestamp": X.index.astype("int64") // 10**9,
         "ML_Signal": signal,
         "SL_Points": sl_pts.values,
+        "Prob":      proba.round(4),
     })
 
     # 7. Score the unlabeled tail (live bars without future reference)
@@ -174,9 +180,14 @@ def process_target(target: dict) -> None:
             "Timestamp": tail_feats.index.astype("int64") // 10**9,
             "ML_Signal": tail_signal,
             "SL_Points": tail_sl,
+            "Prob":      tail_proba.round(4),
         })
         new_df = pd.concat([new_df, tail_df], ignore_index=True)
         latest_proba = float(tail_proba[-1])
+
+    # Attach model-level quality metrics so the indicator can filter by them
+    new_df["Precision"] = _auc              # stores roc_auc (0.50–1.0)
+    new_df["Edge"]      = round(_auc - 0.5, 4)  # lift over random (0.0–0.5)
 
     # Capture latest signal BEFORE freeze-merge can filter new_df down to zero rows
     if not new_df.empty:
@@ -207,6 +218,10 @@ def process_target(target: dict) -> None:
                 merged   = merged.drop_duplicates(subset="Timestamp", keep="last")
                 merged   = merged.sort_values("Timestamp")
                 merged["SL_Points"] = merged["SL_Points"].fillna(0).astype(int)
+                # Backfill Precision/Edge on ALL rows so the indicator can filter
+                # by current model quality (frozen rows retain old-format values otherwise)
+                merged["Precision"] = _auc
+                merged["Edge"]      = round(_auc - 0.5, 4)
                 merged.to_csv(csv_path, index=False)
             else:
                 new_df.to_csv(csv_path, index=False)
@@ -217,16 +232,15 @@ def process_target(target: dict) -> None:
         new_df.to_csv(csv_path, index=False)
 
     # 9. Execute trade on latest signal (quality gate + 2-bar persistence filter)
-    _edge = metrics['precision'] - metrics['baseline_rate']
     signal_label  = "BUY" if latest_signal == 1 else "SELL/FLAT"
     trigger       = "TRIGGERED" if latest_proba > PROB_THRESHOLD else "below"
     # Volatility gate: skip entry when current ATR > 2× the 20-bar ATR median (choppy/gapping bar)
     _atr_median  = float(np.nanmedian(atr14.iloc[-20:].values))
     _atr_current = float(atr14.iloc[-1]) if not np.isnan(float(atr14.iloc[-1])) else _atr_median
     _high_vol    = _atr_current > 2.0 * _atr_median if _atr_median > 0 else False
-    print(f"[{symbol}] signal={signal_label}  proba={latest_proba:.3f} {'>' if latest_proba > PROB_THRESHOLD else '<'} threshold={PROB_THRESHOLD}  ({trigger})  edge={_edge:+.3f}  prec={metrics['precision']:.3f}  sl={avg_sl_val}p  atr={_atr_current:.0f}{'  [HIGH-VOL GATE]' if _high_vol else ''}")
-    # Quality gate: precision, edge, session, and volatility must all pass
-    if metrics['precision'] >= MIN_PRECISION and _edge >= MIN_EDGE and _in_trade_session() and not _high_vol:
+    print(f"[{symbol}] signal={signal_label}  proba={latest_proba:.3f} {'>' if latest_proba > PROB_THRESHOLD else '<'} threshold={PROB_THRESHOLD}  ({trigger})  auc={_auc:.3f} ({'PASS' if _auc >= MIN_AUC else 'FAIL'})  sl={avg_sl_val}p  atr={_atr_current:.0f}{'  [HIGH-VOL GATE]' if _high_vol else ''}")
+    # Quality gate: AUC, session, and volatility must all pass
+    if _auc >= MIN_AUC and _in_trade_session() and not _high_vol:
         buf = _signal_buffer.setdefault(symbol, deque(maxlen=2))
         buf.append(latest_signal)
         _cooldown = _cooldown_counter.get(symbol, 0)
@@ -255,8 +269,11 @@ def run_once() -> None:
     now = pd.Timestamp.now().strftime("%H:%M:%S")
     # Daily loss circuit breaker — halt new entries for the rest of the day
     daily_pnl = _get_daily_pnl()
-    if daily_pnl <= DAILY_MAX_LOSS:
-        print(f"[{now}] Daily loss circuit breaker: P&L={daily_pnl:.2f} ≤ {DAILY_MAX_LOSS}. No new entries today.")
+    _acct = mt5.account_info()
+    _equity = _acct.equity if _acct else 0.0
+    _daily_loss_limit = (DAILY_MAX_LOSS_PCT / 100.0) * _equity
+    if _equity > 0 and daily_pnl <= _daily_loss_limit:
+        print(f"[{now}] Daily loss circuit breaker: P&L={daily_pnl:.2f} ≤ {_daily_loss_limit:.2f} ({DAILY_MAX_LOSS_PCT}% of equity {_equity:.2f}). No new entries today.")
         return
     for t in TARGETS:
         try:
