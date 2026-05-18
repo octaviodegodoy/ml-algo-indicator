@@ -255,6 +255,47 @@ def load_dom_features(slug: str) -> pd.DataFrame:
     large_total = (g['dom_large_bid_vol'] + g['dom_large_ask_vol'])
     all_total   = (g['dom_bid_vol_mean']  + g['dom_ask_vol_mean']).replace(0, np.nan)
     g['dom_large_pct'] = large_total / all_total   # 0 = all small orders, 1 = book dominated by big lots
+
+    # ── Rolling DOM features (cross-bar order-book dynamics) ─────────────────
+    g = g.sort_index()
+
+    # Imbalance rate-of-change over 3 bars (order book building vs unwinding)
+    g['dom_top_imb_chg3']   = g['dom_top_imb_last'].diff(3)
+    g['dom_depth_imb_chg3'] = g['dom_depth_imb_last'].diff(3)
+
+    # Z-score normalisation removes intraday drift so model sees deviation from
+    # the recent regime rather than absolute values
+    for _col in ('dom_top_imb_last', 'dom_depth_imb_last', 'dom_large_imb_last'):
+        _rm  = g[_col].rolling(20).mean()
+        _rs  = g[_col].rolling(20).std().replace(0, np.nan)
+        g[f'{_col}_z20'] = (g[_col] - _rm) / _rs
+
+    # Large-order persistence: consecutive bars where big-lot orders lean the same way
+    # (+3 = 3 bars in a row with bid-side dominance, -2 = 2 bars ask-side, etc.)
+    _large_dir = np.sign(g['dom_large_imb_last'].fillna(0)).astype(int).tolist()
+    _consec: list = []
+    _c = 0
+    for _d in _large_dir:
+        if _d == 0:
+            _c = 0
+        elif _c == 0 or np.sign(_c) == _d:
+            _c += _d
+        else:
+            _c = _d
+        _consec.append(_c)
+    g['dom_large_imb_consec'] = _consec
+
+    # Cumulative intraday DOM pressure (resets each day) — order-book analogue of tick CVD
+    _day_key = g.index.normalize()
+    g['dom_wmid_cumsum']     = g.groupby(_day_key)['dom_wmid_drift_sum'].cumsum()
+    _wm_rm                   = g['dom_wmid_cumsum'].rolling(20).mean()
+    _wm_rs                   = g['dom_wmid_cumsum'].rolling(20).std().replace(0, np.nan)
+    g['dom_wmid_cumsum_z20'] = (g['dom_wmid_cumsum'] - _wm_rm) / _wm_rs
+
+    # Smoothed volume-ratio trend and its momentum
+    g['dom_vol_ratio_ma5']  = g['dom_vol_ratio'].rolling(5).mean()
+    g['dom_vol_ratio_chg3'] = g['dom_vol_ratio'].diff(3)
+
     return g
 
 
