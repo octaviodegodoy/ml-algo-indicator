@@ -47,7 +47,7 @@ HTF_BARS              = 500   # H1 bars to fetch for higher-timeframe context
 #   09:00-09:05  opening auction            → avoid (thin, volatile)
 #   09:05-13:00  day → liquid  ✓
 TRADE_SESSIONS = [
-    ((9,  5), (17,  45)),   # morning session
+    ((10, 0), (15, 45)),   # skip noisy opening hour; 10:00–17:45 BRT has avg prob 13% higher than 9:xx
 ]
 
 # ── Signal freeze ─────────────────────────────────────────────────────────────
