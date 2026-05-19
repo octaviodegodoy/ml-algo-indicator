@@ -23,7 +23,6 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import MetaTrader5 as mt5
-from lightgbm import LGBMClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 
@@ -32,7 +31,7 @@ from config import (
     TB_MAX_BARS, TB_PT_MULT, TB_SL_MULT,
     PROB_THRESHOLD, N_SPLITS_CV, MIN_MICRO_ROWS,
     FREEZE_HISTORY, TRADE_ENABLED, TRADE_SESSIONS, out_path,
-    MIN_AUC, COOLDOWN_BARS, DAILY_MAX_LOSS_PCT,
+    MIN_AUC, COOLDOWN_BARS, DAILY_MAX_LOSS_PCT, MODEL_TYPE,
 )
 from mt5_client import (
     mt5_setup, fetch_bars, append_dom_snapshot, fetch_and_aggregate_ticks,
@@ -43,7 +42,7 @@ from features import (
 )
 from model import (
     triple_barrier_labels, compute_recency_weights,
-    evaluate_walkforward, compute_sl_points,
+    evaluate_walkforward, compute_sl_points, _make_classifier,
 )
 from trade import execute_trade, manage_trailing_stops, manage_grid_orders, init_signal_state
 
@@ -130,10 +129,11 @@ def process_target(target: dict) -> None:
     metrics     = evaluate_walkforward(X, y, N_SPLITS_CV, embargo=TB_MAX_BARS + 1,
                                        weights=rec_weights)
 
+    neg = float((y == 0).sum()); pos = float((y == 1).sum())
+    spw = (neg / pos) if pos > 0 else 1.0
     model = Pipeline([
         ("imp", SimpleImputer(strategy="median")),
-        ("gb",  LGBMClassifier(n_estimators=300, max_depth=4, learning_rate=0.05,
-                               class_weight="balanced", random_state=42, verbosity=-1)),
+        ("gb",  _make_classifier(scale_pos_weight=spw)),
     ])
     model.fit(X, y, gb__sample_weight=rec_weights)
 

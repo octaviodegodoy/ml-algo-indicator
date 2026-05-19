@@ -8,12 +8,37 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 from lightgbm import LGBMClassifier
+try:
+    from xgboost import XGBClassifier
+    _XGBOOST_AVAILABLE = True
+except ImportError:
+    _XGBOOST_AVAILABLE = False
+
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import accuracy_score, precision_score, recall_score, roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 
-from config import RECENCY_DECAY, N_SPLITS_CV
+from config import RECENCY_DECAY, N_SPLITS_CV, MODEL_TYPE
+
+
+def _make_classifier(scale_pos_weight: float = 1.0) -> object:
+    """Return the configured classifier (LightGBM or XGBoost).
+    Falls back to LightGBM if xgboost is not installed in the active Python."""
+    if MODEL_TYPE == 'xgboost':
+        if not _XGBOOST_AVAILABLE:
+            print("WARNING: MODEL_TYPE='xgboost' but xgboost is not installed — falling back to LightGBM.")
+        else:
+            return XGBClassifier(
+                n_estimators=300, max_depth=4, learning_rate=0.05,
+                scale_pos_weight=scale_pos_weight,
+                eval_metric='auc', verbosity=0, random_state=42,
+            )
+    # default / fallback: lightgbm
+    return LGBMClassifier(
+        n_estimators=300, max_depth=4, learning_rate=0.05,
+        class_weight='balanced', random_state=42, verbosity=-1,
+    )
 
 
 # ── Triple-barrier labeling ───────────────────────────────────────────────────
@@ -85,10 +110,13 @@ def evaluate_walkforward(
         if ytr.nunique() < 2:
             continue
         sw = weights[train_idx] if weights is not None else None
+        # XGBoost uses scale_pos_weight instead of class_weight='balanced'
+        neg = float((ytr == 0).sum()); pos = float((ytr == 1).sum())
+        spw = (neg / pos) if pos > 0 else 1.0
+        clf_name = 'gb'
         m  = Pipeline([
             ('imp', SimpleImputer(strategy='median')),
-            ('gb',  LGBMClassifier(n_estimators=300, max_depth=4, learning_rate=0.05,
-                                   class_weight='balanced', random_state=42, verbosity=-1)),
+            ('gb',  _make_classifier(scale_pos_weight=spw)),
         ])
         m.fit(Xtr, ytr, gb__sample_weight=sw)
         pred  = m.predict(Xte)

@@ -24,6 +24,8 @@ TB_PT_MULT        = 1.5          # profit target = 1.5 × ATR(14)
 TB_SL_MULT        = 1.2          # stop loss    = 1.2 × ATR(14)  (widened to survive noise)
 
 # ── Model ─────────────────────────────────────────────────────────────────────
+# 'lightgbm' (default, faster) or 'xgboost' (level-wise, more conservative on noisy labels)
+MODEL_TYPE        = 'xgboost'
 PROB_THRESHOLD    = 0.35         # lowered from 0.40 — more bars cross threshold → more 0→1/1→0 transitions
 MIN_AUC           = 0.46         # lowered: CV walk-forward AUC ≈ 0.47–0.48 while live win rate is 76%; CV metric underestimates live performance
 DAILY_MAX_LOSS_PCT = -2.0           # stop new entries when realized day P&L drops below this % of equity
@@ -63,14 +65,14 @@ TRADE_BOTH_SIDES   = True   # True  = signal 1 → long, signal 0 → short
 RISK_PCT           = 2.0   # % of account balance risked per trade
 MAX_SLIPPAGE       = 10     # maximum allowed slippage in points
 MAGIC_NUMBER       = 20260507  # unique tag for orders placed by this script
-TRAIL_ACTIVATE_PCT = 0.50   # activate trailing stop when profit >= 50% of SL distance
+TRAIL_ACTIVATE_PCT = 0.40   # activate trailing stop when profit >= 50% of SL distance
 
 # ── Grid (Fibonacci martingale) ───────────────────────────────────────────────
 GRID_ENABLED           = True   # seed + grid total volume capped to RISK_PCT budget via _grid_divisor()
 GRID_MAX_LEVELS        = 5      # maximum grid add-ons per seed position
-GRID_STEP_MULT         = 0.80   # grid step = GRID_STEP_MULT × SL-distance in adverse direction
+GRID_STEP_MULT         = 0.50   # grid step = GRID_STEP_MULT × SL-distance in adverse direction
                                  # raised from 0.30 — less aggressive averaging-down
-GRID_PORTFOLIO_SL_MULT = 2.50   # close entire grid when total floating loss exceeds
+GRID_PORTFOLIO_SL_MULT = 3.50   # close entire grid when total floating loss exceeds
                                  # this multiple of (seed_sl_dist × point_value × seed_lot)
                                  # lowered from 5.00 — tighter total grid exposure cap
 
