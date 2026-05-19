@@ -196,25 +196,36 @@ def train_and_score(bars_train: pd.DataFrame, bars_test: pd.DataFrame, p: dict):
 
 # ── P&L simulation ────────────────────────────────────────────────────────────
 def _in_session(ts) -> bool:
-    """Check if a UTC timestamp falls within TRADE_SESSIONS (BRT = UTC-3)."""
-    import pytz
-    brt = ts.tz_convert('America/Sao_Paulo') if ts.tzinfo else ts
-    t = (brt.hour, brt.minute)
+    """Check if a bar timestamp falls within TRADE_SESSIONS.
+
+    NOTE: this broker tags bar timestamps as UTC but actually reports in BRT
+    (broker-local = UTC-3).  Calling tz_convert would shift by -3h and place
+    every bar 3 hours BEFORE its real BRT time, making the session filter block
+    everything.  We therefore read hour/minute directly from the raw timestamp,
+    which already represents BRT.
+    """
+    t = (ts.hour, ts.minute)
     for start, end in TRADE_SESSIONS:
         if start <= t <= end:
             return True
     return False
 
 
-def simulate_pnl(bars_test: pd.DataFrame, signal_series: pd.Series, sl_mult: float):
+def simulate_pnl(bars_test: pd.DataFrame, signal_series: pd.Series, sl_mult: float,
+                 atr_all: pd.Series = None):
     """
     Walk through today's bars and simulate trades.
     Entry / exit are at the close of the triggering bar (conservative).
-    SL = sl_mult × ATR(14) computed from the test bars themselves.
+    SL = sl_mult × ATR(14) computed from the full bar history (atr_all) so the
+    first in-session bar isn't blocked by the 14-bar ATR warmup period.
     Only opens new trades within TRADE_SESSIONS (mirrors live generator).
     Returns (trades_df, summary_dict).
     """
-    atr_test = _atr(bars_test, 14)
+    # Use full-history ATR when provided; fall back to test-only ATR (has NaN warmup)
+    if atr_all is not None:
+        atr_test = atr_all.reindex(bars_test.index)
+    else:
+        atr_test = _atr(bars_test, 14)
     close    = bars_test["Close"]
     high     = bars_test["High"]
     low      = bars_test["Low"]
@@ -317,20 +328,25 @@ def main():
         mt5.shutdown()
         sys.exit(1)
 
-    today_mask = all_bars.index.normalize() == pd.Timestamp(today_str, tz="UTC")
+    # Broker timestamps are in BRT (broker-local), tagged as UTC by fetch_bars.
+    # Use the raw date (== BRT date) for today's split, not tz-converted UTC date.
+    today_mask = all_bars.index.normalize().date == today_str
     bars_today = all_bars[today_mask]
     bars_train = all_bars[~today_mask].iloc[-N_TRAIN_BARS:]
 
     if bars_today.empty:
         # Fallback: try last calendar date present in data
         last_date  = all_bars.index.normalize().unique()[-1]
-        today_mask = all_bars.index.normalize() == last_date
+        today_mask = all_bars.index.normalize().date == last_date.date()
         bars_today = all_bars[today_mask]
         bars_train = all_bars[~today_mask].iloc[-N_TRAIN_BARS:]
         print(f"  (No bars for today in feed — using last available date: {last_date.date()})")
 
     print(f"Training bars : {len(bars_train)}")
     print(f"Today's bars  : {len(bars_today)}")
+
+    # Pre-compute ATR from full history so today's simulation isn't blocked by 14-bar warmup
+    atr_full = _atr(all_bars, 14)
 
     results_map:   dict = {}
     trades_map:    dict = {}
@@ -360,7 +376,7 @@ def main():
             f"buy_bars={n_buy}  sell_bars={n_sell}  undecided={int((signals==-1).sum())}"
         )
 
-        trades_df, summary = simulate_pnl(bars_today, signals, p["sl_mult"])
+        trades_df, summary = simulate_pnl(bars_today, signals, p["sl_mult"], atr_all=atr_full)
         results_map[label] = summary
         trades_map[label]  = trades_df
         print(

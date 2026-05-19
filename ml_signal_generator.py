@@ -32,6 +32,7 @@ from config import (
     PROB_THRESHOLD, N_SPLITS_CV, MIN_MICRO_ROWS,
     FREEZE_HISTORY, TRADE_ENABLED, TRADE_SESSIONS, out_path,
     MIN_AUC, COOLDOWN_BARS, DAILY_MAX_LOSS_PCT, MODEL_TYPE,
+    REQUIRE_DI_CONFIRMATION, DI_CONFIRM_MIN_DIFF, SELL_PERSISTENCE_BARS,
 )
 from mt5_client import (
     mt5_setup, fetch_bars, append_dom_snapshot, fetch_and_aggregate_ticks,
@@ -231,35 +232,46 @@ def process_target(target: dict) -> None:
     else:
         new_df.to_csv(csv_path, index=False)
 
-    # 9. Execute trade on latest signal (quality gate + 2-bar persistence filter)
+    # 9. Execute trade on latest signal (quality gate + asymmetric persistence + DI gate)
     signal_label  = "BUY" if latest_signal == 1 else "SELL/FLAT"
     trigger       = "TRIGGERED" if latest_proba > PROB_THRESHOLD else "below"
     # Volatility gate: skip entry when current ATR > 2× the 20-bar ATR median (choppy/gapping bar)
     _atr_median  = float(np.nanmedian(atr14.iloc[-20:].values))
     _atr_current = float(atr14.iloc[-1]) if not np.isnan(float(atr14.iloc[-1])) else _atr_median
     _high_vol    = _atr_current > 2.0 * _atr_median if _atr_median > 0 else False
-    print(f"[{symbol}] signal={signal_label}  proba={latest_proba:.3f} {'>' if latest_proba > PROB_THRESHOLD else '<'} threshold={PROB_THRESHOLD}  ({trigger})  auc={_auc:.3f} ({'PASS' if _auc >= MIN_AUC else 'FAIL'})  sl={avg_sl_val}p  atr={_atr_current:.0f}{'  [HIGH-VOL GATE]' if _high_vol else ''}")
-    # Quality gate: AUC, session, and volatility must all pass
-    if _auc >= MIN_AUC and _in_trade_session() and not _high_vol:
-        buf = _signal_buffer.setdefault(symbol, deque(maxlen=2))
+
+    # DI directional gate: SELL only when DI− leads DI+ by at least DI_CONFIRM_MIN_DIFF points
+    # (prevents shorting into a pullback where trend hasn't actually confirmed down)
+    _di_diff = float(feats['di_diff_14'].iloc[-1]) if 'di_diff_14' in feats.columns and not np.isnan(feats['di_diff_14'].iloc[-1]) else 0.0
+    _di_ok   = True
+    if REQUIRE_DI_CONFIRMATION:
+        if latest_signal == 0 and _di_diff > -DI_CONFIRM_MIN_DIFF:
+            _di_ok = False   # SELL blocked: DI not confirming downtrend
+        elif latest_signal == 1 and _di_diff < DI_CONFIRM_MIN_DIFF:
+            _di_ok = False   # BUY blocked: DI not confirming uptrend
+
+    print(f"[{symbol}] signal={signal_label}  proba={latest_proba:.3f} {'>' if latest_proba > PROB_THRESHOLD else '<'} threshold={PROB_THRESHOLD}  ({trigger})  auc={_auc:.3f} ({'PASS' if _auc >= MIN_AUC else 'FAIL'})  sl={avg_sl_val}p  atr={_atr_current:.0f}  di_diff={_di_diff:.1f} ({'DI-OK' if _di_ok else 'DI-BLOCKED'}){'  [HIGH-VOL GATE]' if _high_vol else ''}")
+
+    # Quality gate: AUC, session, volatility, and DI direction must all pass
+    if _auc >= MIN_AUC and _in_trade_session() and not _high_vol and _di_ok:
+        # Asymmetric persistence: SELL requires SELL_PERSISTENCE_BARS consecutive bars,
+        # BUY requires only 2.  Prevents confirming a short at reversal extremes.
+        _sell_persist = SELL_PERSISTENCE_BARS
+        buf = _signal_buffer.setdefault(symbol, deque(maxlen=max(2, _sell_persist)))
         buf.append(latest_signal)
-        _cooldown = _cooldown_counter.get(symbol, 0)
+        _required = _sell_persist if latest_signal == 0 else 2
+        _cooldown  = _cooldown_counter.get(symbol, 0)
         if _cooldown > 0:
             _cooldown_counter[symbol] = _cooldown - 1
             print(f"[{symbol}] trade HELD — cooldown ({_cooldown - 1} bars remaining)")
-        elif len(buf) >= 2 and len(set(buf)) == 1:
+        elif len(buf) >= _required and len(set(list(buf)[-_required:])) == 1:
             execute_trade(symbol, latest_signal, avg_sl_val)
             # Reset cooldown on flat signal (signal=0 means close long / go flat)
             # so the next long entry waits COOLDOWN_BARS bars before re-entering
             if latest_signal == 0:
                 _cooldown_counter[symbol] = COOLDOWN_BARS
         else:
-            reason = (
-                f"persistence waiting ({len(buf)}/2 bars, buf={list(buf)})"
-                if len(buf) < 2 or len(set(buf)) != 1
-                else "execute_trade: no signal transition"
-            )
-            print(f"[{symbol}] trade HELD — {reason}")
+            print(f"[{symbol}] trade HELD — persistence waiting ({len(buf)}/{_required} bars, buf={list(buf)[-_required:]})")
 
     return None
 

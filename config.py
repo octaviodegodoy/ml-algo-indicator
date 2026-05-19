@@ -27,7 +27,7 @@ TB_SL_MULT        = 1.2          # stop loss    = 1.2 × ATR(14)  (widened to su
 # 'lightgbm' (default, faster) or 'xgboost' (level-wise, more conservative on noisy labels)
 MODEL_TYPE        = 'xgboost'
 PROB_THRESHOLD    = 0.35         # lowered from 0.40 — more bars cross threshold → more 0→1/1→0 transitions
-MIN_AUC           = 0.46         # lowered: CV walk-forward AUC ≈ 0.47–0.48 while live win rate is 76%; CV metric underestimates live performance
+MIN_AUC           = 0.50         # raised: below 0.50 = model has no edge over random walk; false sell on 2026-05-19 had AUC=0.48 (edge=-0.049)
 DAILY_MAX_LOSS_PCT = -2.0           # stop new entries when realized day P&L drops below this % of equity
 INTERVAL_SECONDS  = 60
 N_SPLITS_CV       = 5
@@ -35,6 +35,17 @@ RECENCY_DECAY     = 1.2          # lowered from 2.0 — reduces oversensitivity 
 
 # ── Cooldown after stop-out ───────────────────────────────────────────────────
 COOLDOWN_BARS     = 6            # bars to skip re-entry after a stop-out (halved from 12 → 30 min buffer)
+
+# ── Directional confirmation gate ─────────────────────────────────────────────
+# When True, a SELL signal is only executed when DI− > DI+ (di_diff_14 < −DI_CONFIRM_MIN_DIFF)
+# and a BUY signal is only executed when DI+ > DI− (di_diff_14 > +DI_CONFIRM_MIN_DIFF).
+# Prevents entering counter-trend shorts/longs at reversal extremes (e.g. false sell on 2026-05-19).
+REQUIRE_DI_CONFIRMATION = True
+DI_CONFIRM_MIN_DIFF     = 3.0   # minimum |DI+ − DI−| to consider direction confirmed (filters noise near zero)
+
+# Separate persistence for SELL transitions: SELL requires more bars than BUY to confirm
+# because shorting into a bullish-trend pullback is the primary false-signal failure mode.
+SELL_PERSISTENCE_BARS   = 3     # consecutive SELL bars required to enter SHORT (vs 2 for BUY)
 
 # ── Microstructure ────────────────────────────────────────────────────────────
 DOM_LEVELS            = 5     # top-N book levels to aggregate
