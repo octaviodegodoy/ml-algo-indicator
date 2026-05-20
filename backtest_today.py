@@ -45,7 +45,7 @@ from mt5_client import fetch_bars, mt5_setup
 from config import (
     N_BARS, PROB_THRESHOLD, RECENCY_DECAY,
     TB_SL_MULT, TB_PT_MULT, TB_MAX_BARS,
-    MIN_AUC, TRADE_SESSIONS,
+    MIN_AUC, TRADE_SESSIONS, MIN_FLIP_PROFIT_PTS,
 )
 
 # ── Simulation constants ──────────────────────────────────────────────────────
@@ -61,40 +61,44 @@ EMBARGO      = 12
 # ── OLD vs NEW parameter sets ─────────────────────────────────────────────────
 PARAMS = {
     "BASELINE": dict(
-        prob_threshold   = 0.50,
-        recency_decay    = 2.0,
-        sl_mult          = 1.0,
-        pt_mult          = 1.5,
-        max_bars         = 12,
-        use_persistence  = False,
-        use_quality_gate = False,
+        prob_threshold      = 0.50,
+        recency_decay       = 2.0,
+        sl_mult             = 1.0,
+        pt_mult             = 1.5,
+        max_bars            = 12,
+        use_persistence     = False,
+        use_quality_gate    = False,
+        min_flip_profit_pts = 0,          # no guard — pure signal-flip exits
     ),
     "OLD": dict(
-        prob_threshold   = 0.50,
-        recency_decay    = 2.0,
-        sl_mult          = 1.0,
-        pt_mult          = 1.5,
-        max_bars         = 12,
-        use_persistence  = False,
-        use_quality_gate = False,
+        prob_threshold      = 0.50,
+        recency_decay       = 2.0,
+        sl_mult             = 1.0,
+        pt_mult             = 1.5,
+        max_bars            = 12,
+        use_persistence     = False,
+        use_quality_gate    = False,
+        min_flip_profit_pts = 0,          # no guard
     ),
     "NEW": dict(
-        prob_threshold   = PROB_THRESHOLD,   # from config.py
-        recency_decay    = RECENCY_DECAY,    # from config.py
-        sl_mult          = TB_SL_MULT,       # from config.py
-        pt_mult          = TB_PT_MULT,       # from config.py
-        max_bars         = TB_MAX_BARS,      # from config.py
-        use_persistence  = True,
-        use_quality_gate = True,
+        prob_threshold      = PROB_THRESHOLD,        # from config.py
+        recency_decay       = RECENCY_DECAY,         # from config.py
+        sl_mult             = TB_SL_MULT,            # from config.py
+        pt_mult             = TB_PT_MULT,            # from config.py
+        max_bars            = TB_MAX_BARS,           # from config.py
+        use_persistence     = True,
+        use_quality_gate    = True,
+        min_flip_profit_pts = MIN_FLIP_PROFIT_PTS,   # from config.py
     ),
     "THRESHOLD_060": dict(
-        prob_threshold   = 0.60,
-        recency_decay    = RECENCY_DECAY,
-        sl_mult          = TB_SL_MULT,
-        pt_mult          = TB_PT_MULT,
-        max_bars         = TB_MAX_BARS,
-        use_persistence  = True,
-        use_quality_gate = True,
+        prob_threshold      = 0.60,
+        recency_decay       = RECENCY_DECAY,
+        sl_mult             = TB_SL_MULT,
+        pt_mult             = TB_PT_MULT,
+        max_bars            = TB_MAX_BARS,
+        use_persistence     = True,
+        use_quality_gate    = True,
+        min_flip_profit_pts = MIN_FLIP_PROFIT_PTS,   # from config.py
     ),
 }
 
@@ -206,12 +210,15 @@ def _in_session(ts) -> bool:
     return False
 
 
-def simulate_pnl(bars_test: pd.DataFrame, signal_series: pd.Series, sl_mult: float):
+def simulate_pnl(bars_test: pd.DataFrame, signal_series: pd.Series, sl_mult: float,
+                 min_flip_profit_pts: int = 0):
     """
     Walk through today's bars and simulate trades.
     Entry / exit are at the close of the triggering bar (conservative).
     SL = sl_mult × ATR(14) computed from the test bars themselves.
     Only opens new trades within TRADE_SESSIONS (mirrors live generator).
+    min_flip_profit_pts: suppress signal-flip exit while unrealised profit
+        is positive but below this threshold (mirrors live MIN_FLIP_PROFIT_PTS).
     Returns (trades_df, summary_dict).
     """
     atr_test = _atr(bars_test, 14)
@@ -262,10 +269,14 @@ def simulate_pnl(bars_test: pd.DataFrame, signal_series: pd.Series, sl_mult: flo
             prev_sig = sig
             continue
 
-        # Direction flip while in a trade → close it
+        # Direction flip while in a trade → close it (subject to min-profit guard)
         if in_trade and sig != prev_sig and prev_sig != -1 and not np.isnan(c):
-            _close_trade(ts, c, "SIGNAL")
-            in_trade = False
+            unrealised_pts = (c - entry_price) if direction == 1 else (entry_price - c)
+            if min_flip_profit_pts > 0 and 0 < unrealised_pts < min_flip_profit_pts:
+                pass  # hold: winning but below threshold — wait for more profit
+            else:
+                _close_trade(ts, c, "SIGNAL")
+                in_trade = False
 
         # Open a trade whenever we have a confirmed signal and are flat
         # (retry every bar so NaN ATR at warm-up doesn't permanently block entry)
@@ -360,7 +371,8 @@ def main():
             f"buy_bars={n_buy}  sell_bars={n_sell}  undecided={int((signals==-1).sum())}"
         )
 
-        trades_df, summary = simulate_pnl(bars_today, signals, p["sl_mult"])
+        trades_df, summary = simulate_pnl(bars_today, signals, p["sl_mult"],
+                                           min_flip_profit_pts=p.get("min_flip_profit_pts", 0))
         results_map[label] = summary
         trades_map[label]  = trades_df
         print(
