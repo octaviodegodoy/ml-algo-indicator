@@ -36,6 +36,17 @@ RECENCY_DECAY     = 1.2          # lowered from 2.0 — reduces oversensitivity 
 # ── Cooldown after stop-out ───────────────────────────────────────────────────
 COOLDOWN_BARS     = 6            # bars to skip re-entry after a stop-out (halved from 12 → 30 min buffer)
 
+# ── Directional confirmation gate ─────────────────────────────────────────────
+# When True, a SELL signal is only executed when DI− > DI+ (di_diff_14 < −DI_CONFIRM_MIN_DIFF)
+# and a BUY signal is only executed when DI+ > DI− (di_diff_14 > +DI_CONFIRM_MIN_DIFF).
+# Prevents entering counter-trend shorts/longs at reversal extremes (e.g. false sell on 2026-05-19).
+REQUIRE_DI_CONFIRMATION = True
+DI_CONFIRM_MIN_DIFF     = 3.0   # minimum |DI+ − DI−| to consider direction confirmed (filters noise near zero)
+
+# Separate persistence for SELL transitions: SELL requires more bars than BUY to confirm
+# because shorting into a bullish-trend pullback is the primary false-signal failure mode.
+SELL_PERSISTENCE_BARS   = 3     # consecutive SELL bars required to enter SHORT (vs 2 for BUY)
+
 # ── Microstructure ────────────────────────────────────────────────────────────
 DOM_LEVELS            = 5     # top-N book levels to aggregate
 DOM_SAMPLE_SECS       = 5     # background thread samples DOM every N seconds (was once per 60s cycle)
