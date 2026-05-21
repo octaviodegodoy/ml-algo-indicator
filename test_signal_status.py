@@ -28,7 +28,8 @@ from config import (
     GRID_ENABLED, GRID_MAX_LEVELS, GRID_STEP_MULT, GRID_PORTFOLIO_SL_MULT,
     MIN_MICRO_ROWS,
 )
-from mt5_client import mt5_setup, fetch_bars, append_dom_snapshot, fetch_and_aggregate_ticks
+from mt5_client import mt5_setup, fetch_bars, fetch_htf_bars
+from microstructure import append_dom_snapshot, fetch_and_aggregate_ticks
 from features import (
     _atr, make_features, add_time_features,
     load_dom_features, load_tick_features, make_htf_features, merge_microstructure,
@@ -111,7 +112,7 @@ def run_diagnostics(target: dict) -> None:
 
     feats, n_dom  = merge_microstructure(feats, dom_raw,  prefix="dom")
     feats, n_tick = merge_microstructure(feats, tick_raw, prefix="tick")
-    htf = make_htf_features(symbol, bars)
+    htf = make_htf_features(fetch_htf_bars(symbol), bars)
     if not htf.empty:
         feats = pd.concat([feats, htf], axis=1)
 

@@ -4,11 +4,10 @@ VWAP, higher-timeframe context, microstructure loaders, and merge helpers.
 """
 
 import os
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import MetaTrader5 as mt5
 
 from config import TF_SECONDS, HTF_BARS, MIN_MICRO_ROWS, dom_path, ticks_path
 
@@ -178,19 +177,15 @@ def add_vwap_features(out: pd.DataFrame, df: pd.DataFrame, atr14: pd.Series) -> 
 
 
 # ── Higher-timeframe (H1) context features ────────────────────────────────────
-def make_htf_features(symbol: str, bars_m5: pd.DataFrame) -> pd.DataFrame:
-    """Fetch H1 bars, compute context features, and forward-fill onto the M5 index."""
-    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H1, 0, HTF_BARS)
-    if rates is None or len(rates) == 0:
+def make_htf_features(htf_bars: Optional[pd.DataFrame], bars_m5: pd.DataFrame) -> pd.DataFrame:
+    """Compute H1 context features from pre-fetched bars and forward-fill onto the M5 index.
+
+    Accepts a pre-fetched DataFrame (from mt5_client.fetch_htf_bars) instead of calling MT5
+    directly, so the feature-engineering layer has no platform dependency (DIP).
+    """
+    if htf_bars is None or htf_bars.empty:
         return pd.DataFrame(index=bars_m5.index)
-    df = pd.DataFrame(rates)
-    df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
-    df.set_index('time', inplace=True)
-    df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low',
-                       'close': 'Close', 'tick_volume': 'Volume'}, inplace=True)
-    df = df[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
-    if df.empty:
-        return pd.DataFrame(index=bars_m5.index)
+    df = htf_bars
 
     htf = pd.DataFrame(index=df.index)
     htf['h1_ret_1']      = df['Close'].pct_change(1)

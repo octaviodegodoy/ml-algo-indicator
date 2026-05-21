@@ -34,9 +34,8 @@ from config import (
     MIN_AUC, COOLDOWN_BARS, DAILY_MAX_LOSS_PCT, MODEL_TYPE,
     REQUIRE_DI_CONFIRMATION, DI_CONFIRM_MIN_DIFF, SELL_PERSISTENCE_BARS,
 )
-from mt5_client import (
-    mt5_setup, fetch_bars, append_dom_snapshot, fetch_and_aggregate_ticks,
-)
+from mt5_client import mt5_setup, fetch_bars, fetch_htf_bars
+from microstructure import append_dom_snapshot, fetch_and_aggregate_ticks
 from features import (
     _atr, make_features, add_time_features,
     load_dom_features, load_tick_features, make_htf_features, merge_microstructure,
@@ -100,7 +99,7 @@ def process_target(target: dict) -> None:
     feats = add_time_features(feats)
     feats, _  = merge_microstructure(feats, load_dom_features(slug),  prefix="dom")
     feats, _  = merge_microstructure(feats, load_tick_features(slug), prefix="tick")
-    htf_feats = make_htf_features(symbol, bars)
+    htf_feats = make_htf_features(fetch_htf_bars(symbol), bars)
     if not htf_feats.empty:
         feats = pd.concat([feats, htf_feats], axis=1)
 

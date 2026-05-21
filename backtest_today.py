@@ -41,16 +41,15 @@ from model import (
     evaluate_walkforward,
     triple_barrier_labels,
 )
-from mt5_client import fetch_bars, mt5_setup
+from mt5_client import fetch_bars, fetch_htf_bars, mt5_setup
 from config import (
     N_BARS, PROB_THRESHOLD, RECENCY_DECAY,
     TB_SL_MULT, TB_PT_MULT, TB_MAX_BARS,
-    MIN_AUC, TRADE_SESSIONS,
+    MIN_AUC, TRADE_SESSIONS, TIMEFRAME,
 )
 
-# ── Simulation constants ──────────────────────────────────────────────────────
+# ── Simulation constants ─────────────────────────────────────────────
 SYMBOL       = "WINM26"
-TIMEFRAME    = mt5.TIMEFRAME_M5
 N_TRAIN_BARS = N_BARS
 LOTS         = 5       # fixed 1 mini lot per trade for a fair comparison
 TICK_VALUE   = 0.20    # R$ per point per mini lot (WINM26 standard)
@@ -112,7 +111,7 @@ def train_and_score(bars_train: pd.DataFrame, bars_test: pd.DataFrame, p: dict):
 
     feats_train = make_features(bars_train)
     feats_train = add_time_features(feats_train)
-    htf_train   = make_htf_features(SYMBOL, bars_train)
+    htf_train   = make_htf_features(fetch_htf_bars(SYMBOL), bars_train)
     if not htf_train.empty:
         feats_train = pd.concat([feats_train, htf_train], axis=1)
 
@@ -160,7 +159,7 @@ def train_and_score(bars_train: pd.DataFrame, bars_test: pd.DataFrame, p: dict):
     # Score test bars using the same feature columns as training
     feats_test = make_features(bars_test)
     feats_test = add_time_features(feats_test)
-    htf_test   = make_htf_features(SYMBOL, bars_test)
+    htf_test   = make_htf_features(fetch_htf_bars(SYMBOL), bars_test)
     if not htf_test.empty:
         feats_test = pd.concat([feats_test, htf_test], axis=1)
     feats_test = feats_test.reindex(columns=X_train.columns, fill_value=np.nan)

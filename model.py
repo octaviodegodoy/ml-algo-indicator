@@ -22,23 +22,36 @@ from sklearn.pipeline import Pipeline
 from config import RECENCY_DECAY, N_SPLITS_CV, MODEL_TYPE
 
 
-def _make_classifier(scale_pos_weight: float = 1.0) -> object:
-    """Return the configured classifier (LightGBM or XGBoost).
-    Falls back to LightGBM if xgboost is not installed in the active Python."""
-    if MODEL_TYPE == 'xgboost':
-        if not _XGBOOST_AVAILABLE:
-            print("WARNING: MODEL_TYPE='xgboost' but xgboost is not installed — falling back to LightGBM.")
-        else:
-            return XGBClassifier(
-                n_estimators=300, max_depth=4, learning_rate=0.05,
-                scale_pos_weight=scale_pos_weight,
-                eval_metric='auc', verbosity=0, random_state=42,
-            )
-    # default / fallback: lightgbm
+# ── Classifier registry (OCP: add new model types without modifying callers) ──
+def _lgbm_factory(scale_pos_weight: float) -> object:
     return LGBMClassifier(
         n_estimators=300, max_depth=4, learning_rate=0.05,
         class_weight='balanced', random_state=42, verbosity=-1,
     )
+
+
+def _xgb_factory(scale_pos_weight: float) -> object:
+    if not _XGBOOST_AVAILABLE:
+        print("WARNING: MODEL_TYPE='xgboost' but xgboost is not installed — falling back to LightGBM.")
+        return _lgbm_factory(scale_pos_weight)
+    return XGBClassifier(
+        n_estimators=300, max_depth=4, learning_rate=0.05,
+        scale_pos_weight=scale_pos_weight,
+        eval_metric='auc', verbosity=0, random_state=42,
+    )
+
+
+_CLASSIFIER_REGISTRY: dict = {
+    'lightgbm': _lgbm_factory,
+    'xgboost':  _xgb_factory,
+}
+
+
+def _make_classifier(scale_pos_weight: float = 1.0) -> object:
+    """Return the configured classifier using the registry.
+    To add a new model type, register a factory in _CLASSIFIER_REGISTRY."""
+    factory = _CLASSIFIER_REGISTRY.get(MODEL_TYPE, _lgbm_factory)
+    return factory(scale_pos_weight)
 
 
 # ── Triple-barrier labeling ───────────────────────────────────────────────────

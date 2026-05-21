@@ -4,7 +4,6 @@ Imported by every other module; keep it free of heavy logic.
 """
 
 import os
-import MetaTrader5 as mt5
 
 # ── Targets ───────────────────────────────────────────────────────────────────
 # Each target produces one CSV. `slug` controls output filenames
@@ -14,7 +13,9 @@ TARGETS = [
 ]
 
 # ── Bar / timeframe ───────────────────────────────────────────────────────────
-TIMEFRAME         = mt5.TIMEFRAME_M5
+# mt5.TIMEFRAME_M5 == 5  (raw integer from the MT5 enum — avoids importing MT5
+# in config so the config module has no platform dependency).
+TIMEFRAME         = 5
 TF_SECONDS        = 5 * 60
 N_BARS            = 15000
 

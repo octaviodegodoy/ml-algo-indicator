@@ -1,75 +1,114 @@
 """
-mt5_client.py — MT5 lifecycle and bar fetching.
-Single responsibility: platform connection and raw OHLCV data retrieval.
+microstructure.py — DOM snapshot collection, background sampling thread, and
+tick aggregation.  Single responsibility: real-time microstructure data capture.
 
-DOM snapshot collection and tick aggregation live in microstructure.py.
+Called by mt5_client.setup() / teardown() to integrate with the MT5 lifecycle.
 """
 
-import atexit
+import os
+import time
+import threading
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 import MetaTrader5 as mt5
 
-from config import TARGETS, HTF_BARS
-import microstructure
+from config import (
+    TARGETS,
+    DOM_LEVELS, DOM_SAMPLE_SECS, DOM_MIN_LEVEL_LOTS, DOM_LARGE_ORDER_LOTS,
+    TF_SECONDS, dom_path, ticks_path,
+)
+
+# ── Module-level state ────────────────────────────────────────────────────────
+_subscribed_books:     list             = []
+_dom_thread:           Optional[threading.Thread] = None
+_dom_thread_stop:      threading.Event            = threading.Event()
+_dom_schema_validated: set              = set()
+_dom_csv_lock                           = threading.Lock()
+_no_tick_symbols:      set              = set()
+
+# Per-symbol state for refresh-rate tracking
+_dom_prev_bid: dict = {}
+_dom_prev_ask: dict = {}
+_dom_prev_mid: dict = {}
+
+_last_tick_ts: dict = {}   # per-symbol incremental cursor
 
 
-# ── MT5 lifecycle ─────────────────────────────────────────────────────────────
-def mt5_setup() -> None:
-    if not mt5.initialize():
-        raise RuntimeError(f"MT5 initialize() failed: {mt5.last_error()}")
-    seen: set = set()
-    for t in TARGETS:
+# ── Lifecycle ─────────────────────────────────────────────────────────────────
+def setup(targets: list) -> None:
+    """Subscribe to DOM books for all targets, run broker capability check, start sampler."""
+    for t in targets:
         s = t['symbol']
-        if s in seen:
-            continue
-        seen.add(s)
-        if not mt5.symbol_select(s, True):
-            print(f"Warning: could not select {s} in Market Watch")
-    print(f"MT5 connected. Targets: {[t['symbol'] for t in TARGETS]}")
-    microstructure.setup(TARGETS)
+        if mt5.market_book_add(s):
+            _subscribed_books.append(s)
+            print(f"DOM subscribed: {s}")
+        else:
+            print(f"Warning: market_book_add({s}) failed — DOM features unavailable for it")
+    _check_broker_capabilities(targets)
+    _start_dom_thread()
 
 
-def mt5_teardown() -> None:
-    microstructure.teardown()
-    mt5.shutdown()
-    print("MT5 disconnected.")
+def teardown() -> None:
+    """Stop the background sampler and release all DOM subscriptions."""
+    _dom_thread_stop.set()
+    if _dom_thread is not None:
+        _dom_thread.join(timeout=10)
+    for s in _subscribed_books:
+        try:
+            mt5.market_book_release(s)
+        except Exception:
+            pass
 
 
-atexit.register(mt5_teardown)
+# ── Broker capability check ───────────────────────────────────────────────────
+def _check_broker_capabilities(targets: list) -> None:
+    """One-time startup check: log which data sources are available per symbol."""
+    now = int(time.time())
+    print("── Broker capability check ──────────────────────────────")
+    for t in targets:
+        s      = t['symbol']
+        book   = mt5.market_book_get(s)
+        dom_ok = book is not None and len(book) > 0
+        ticks  = mt5.copy_ticks_range(
+            s,
+            pd.to_datetime(now - 600, unit='s'),
+            pd.to_datetime(now,       unit='s'),
+            mt5.COPY_TICKS_TRADE,
+        )
+        tick_ok = ticks is not None and len(ticks) > 0
+        print(
+            f"  {s}:  DOM={'YES (' + str(len(book)) + ' levels)' if dom_ok else 'NO — L2 not provided by broker'}"
+            f"  |  Ticks={'YES (' + str(len(ticks)) + ')' if tick_ok else 'NO — tick history not provided by broker'}"
+        )
+        if not tick_ok:
+            _no_tick_symbols.add(s)
+    print("─────────────────────────────────────────────────────────")
 
 
-# ── Bar fetch ─────────────────────────────────────────────────────────────────
-def fetch_bars(symbol: str, timeframe, n: int) -> Optional[pd.DataFrame]:
-    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, n)
-    if rates is None or len(rates) == 0:
-        return None
-    df = pd.DataFrame(rates)
-    df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
-    df.set_index('time', inplace=True)
-    df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low',
-                       'close': 'Close', 'tick_volume': 'Volume'}, inplace=True)
-    return df[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+# ── DOM snapshot ──────────────────────────────────────────────────────────────
+def _ensure_dom_schema(path: str, snap: dict) -> None:
+    """Delete DOM CSV if its column schema no longer matches the current snapshot keys."""
+    if path in _dom_schema_validated:
+        return
+    _dom_schema_validated.add(path)
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, 'r') as _f:
+            header_cols = _f.readline().strip().split(',')
+        if set(header_cols) != set(snap.keys()):
+            os.remove(path)
+            print(f"DOM schema mismatch — stale file removed: {path}")
+    except Exception:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
 
 
-# ── Higher-timeframe bar fetch ────────────────────────────────────────────────
-def fetch_htf_bars(symbol: str) -> Optional[pd.DataFrame]:
-    """Return HTF_BARS H1 bars for the given symbol, or None on failure.
-
-    Keeping this in mt5_client (not features.py) respects SRP: the feature
-    layer computes features; the client layer fetches raw data.
-    """
-    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H1, 0, HTF_BARS)
-    if rates is None or len(rates) == 0:
-        return None
-    df = pd.DataFrame(rates)
-    df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
-    df.set_index('time', inplace=True)
-    df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low',
-                       'close': 'Close', 'tick_volume': 'Volume'}, inplace=True)
-    return df[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
-
+def _snapshot_dom(symbol: str) -> Optional[dict]:
     book = mt5.market_book_get(symbol)
     if book is None or len(book) == 0:
         return None
@@ -82,10 +121,8 @@ def fetch_htf_bars(symbol: str) -> Optional[pd.DataFrame]:
     bids.sort(key=lambda x: -x[0])
     asks.sort(key=lambda x:  x[0])
 
-    # Filter noise: drop levels below minimum lot threshold
     bids_f = [(p, v) for p, v in bids if v >= DOM_MIN_LEVEL_LOTS]
     asks_f = [(p, v) for p, v in asks if v >= DOM_MIN_LEVEL_LOTS]
-    # Fall back to unfiltered if too thin (e.g. pre-market)
     if not bids_f or not asks_f:
         bids_f, asks_f = bids, asks
 
@@ -98,9 +135,8 @@ def fetch_htf_bars(symbol: str) -> Optional[pd.DataFrame]:
     ask_vol_n = sum(v for _, v in asks_f[:DOM_LEVELS])
     total     = bid_vol_n + ask_vol_n
 
-    # Large / iceberg order detection: levels ≥ DOM_LARGE_ORDER_LOTS
-    large_bids = [(p, v) for p, v in bids_f[:DOM_LEVELS] if v >= DOM_LARGE_ORDER_LOTS]
-    large_asks = [(p, v) for p, v in asks_f[:DOM_LEVELS] if v >= DOM_LARGE_ORDER_LOTS]
+    large_bids       = [(p, v) for p, v in bids_f[:DOM_LEVELS] if v >= DOM_LARGE_ORDER_LOTS]
+    large_asks       = [(p, v) for p, v in asks_f[:DOM_LEVELS] if v >= DOM_LARGE_ORDER_LOTS]
     large_bid_levels = len(large_bids)
     large_ask_levels = len(large_asks)
     large_bid_vol    = sum(v for _, v in large_bids)
@@ -108,17 +144,13 @@ def fetch_htf_bars(symbol: str) -> Optional[pd.DataFrame]:
     large_total      = large_bid_vol + large_ask_vol
     large_imbalance  = (large_bid_vol - large_ask_vol) / large_total if large_total > 0 else 0.0
 
-    # Weighted mid-price: fairer fair-value estimate than simple mid
     w_mid = (ask_vol_n * best_bid + bid_vol_n * best_ask) / total if total > 0 else mid
 
-    # Book refresh rate: did the best quotes move since last snapshot?
-    prev_bid      = _dom_prev_bid.get(symbol, best_bid)
-    prev_ask      = _dom_prev_ask.get(symbol, best_ask)
+    prev_bid       = _dom_prev_bid.get(symbol, best_bid)
+    prev_ask       = _dom_prev_ask.get(symbol, best_ask)
     book_refreshed = int(best_bid != prev_bid or best_ask != prev_ask)
-
-    # Weighted mid drift from last snapshot (directional pressure)
-    prev_mid   = _dom_prev_mid.get(symbol, w_mid)
-    wmid_drift = w_mid - prev_mid
+    prev_mid       = _dom_prev_mid.get(symbol, w_mid)
+    wmid_drift     = w_mid - prev_mid
 
     _dom_prev_bid[symbol] = best_bid
     _dom_prev_ask[symbol] = best_ask
@@ -138,17 +170,16 @@ def fetch_htf_bars(symbol: str) -> Optional[pd.DataFrame]:
         'weighted_mid':     w_mid,
         'wmid_drift':       wmid_drift,
         'book_refreshed':   book_refreshed,
-        # Large-order / iceberg fields
         'large_bid_levels': large_bid_levels,
         'large_ask_levels': large_ask_levels,
         'large_bid_vol':    large_bid_vol,
         'large_ask_vol':    large_ask_vol,
-        'large_imbalance':  large_imbalance,   # +1 = all big lots on bid, -1 = all on ask
+        'large_imbalance':  large_imbalance,
     }
 
 
 def append_dom_snapshot(symbol: str, slug: str) -> bool:
-    """Called from main loop to confirm DOM is live; actual high-freq sampling is on background thread."""
+    """Capture one DOM snapshot and append it to the per-slug CSV. Returns True on success."""
     snap = _snapshot_dom(symbol)
     if snap is None:
         return False
@@ -159,8 +190,8 @@ def append_dom_snapshot(symbol: str, slug: str) -> bool:
     return True
 
 
+# ── Background DOM sampler ────────────────────────────────────────────────────
 def _dom_sampling_thread() -> None:
-    """Background thread: samples DOM every DOM_SAMPLE_SECS for all subscribed symbols."""
     slug_map = {t['symbol']: t['slug'] for t in TARGETS}
     while not _dom_thread_stop.is_set():
         for symbol in _subscribed_books:
@@ -193,10 +224,8 @@ def _start_dom_thread() -> None:
 
 
 # ── Trade-tick aggregator ─────────────────────────────────────────────────────
-_last_tick_ts: dict = {}  # per-symbol incremental cursor
-
-
 def fetch_and_aggregate_ticks(symbol: str, slug: str) -> int:
+    """Fetch new trade ticks since the last call and append bar-aggregations. Returns row count."""
     if symbol in _no_tick_symbols:
         return 0
     now   = int(time.time())
@@ -237,12 +266,8 @@ def fetch_and_aggregate_ticks(symbol: str, slug: str) -> int:
     agg['delta_vol'] = agg['buy_vol'] - agg['sell_vol']
     total_vol        = agg['buy_vol'] + agg['sell_vol']
 
-    # Absorption ratio: heavy volume relative to price movement within the bar
-    # High ratio = large trades absorbed without proportional price move → hidden resistance/support
     price_range = (agg['max_price'] - agg['min_price']).replace(0, np.nan)
-    agg['absorption_ratio'] = total_vol / price_range   # lots per point moved
-
-    # Price efficiency: how much of the bar range was actually used (tight = contested, wide = breakout)
+    agg['absorption_ratio'] = total_vol / price_range
     agg['price_efficiency'] = (agg['last_price'] - agg['first_price']).abs() / price_range.replace(np.nan, 1)
     agg['price_efficiency'] = agg['price_efficiency'].fillna(0)
 
