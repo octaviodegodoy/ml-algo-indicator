@@ -60,40 +60,44 @@ EMBARGO      = 12
 # ── OLD vs NEW parameter sets ─────────────────────────────────────────────────
 PARAMS = {
     "BASELINE": dict(
-        prob_threshold   = 0.50,
-        recency_decay    = 2.0,
-        sl_mult          = 1.0,
-        pt_mult          = 1.5,
-        max_bars         = 12,
-        use_persistence  = False,
-        use_quality_gate = False,
+        prob_threshold      = 0.50,
+        recency_decay       = 2.0,
+        sl_mult             = 1.0,
+        pt_mult             = 1.5,
+        max_bars            = 12,
+        use_persistence     = False,
+        use_quality_gate    = False,
+        min_flip_profit_pts = 0,          # no guard — pure signal-flip exits
     ),
     "OLD": dict(
-        prob_threshold   = 0.50,
-        recency_decay    = 2.0,
-        sl_mult          = 1.0,
-        pt_mult          = 1.5,
-        max_bars         = 12,
-        use_persistence  = False,
-        use_quality_gate = False,
+        prob_threshold      = 0.50,
+        recency_decay       = 2.0,
+        sl_mult             = 1.0,
+        pt_mult             = 1.5,
+        max_bars            = 12,
+        use_persistence     = False,
+        use_quality_gate    = False,
+        min_flip_profit_pts = 0,          # no guard
     ),
     "NEW": dict(
-        prob_threshold   = PROB_THRESHOLD,   # from config.py
-        recency_decay    = RECENCY_DECAY,    # from config.py
-        sl_mult          = TB_SL_MULT,       # from config.py
-        pt_mult          = TB_PT_MULT,       # from config.py
-        max_bars         = TB_MAX_BARS,      # from config.py
-        use_persistence  = True,
-        use_quality_gate = True,
+        prob_threshold      = PROB_THRESHOLD,        # from config.py
+        recency_decay       = RECENCY_DECAY,         # from config.py
+        sl_mult             = TB_SL_MULT,            # from config.py
+        pt_mult             = TB_PT_MULT,            # from config.py
+        max_bars            = TB_MAX_BARS,           # from config.py
+        use_persistence     = True,
+        use_quality_gate    = True,
+        min_flip_profit_pts = MIN_FLIP_PROFIT_PTS,   # from config.py
     ),
     "THRESHOLD_060": dict(
-        prob_threshold   = 0.60,
-        recency_decay    = RECENCY_DECAY,
-        sl_mult          = TB_SL_MULT,
-        pt_mult          = TB_PT_MULT,
-        max_bars         = TB_MAX_BARS,
-        use_persistence  = True,
-        use_quality_gate = True,
+        prob_threshold      = 0.60,
+        recency_decay       = RECENCY_DECAY,
+        sl_mult             = TB_SL_MULT,
+        pt_mult             = TB_PT_MULT,
+        max_bars            = TB_MAX_BARS,
+        use_persistence     = True,
+        use_quality_gate    = True,
+        min_flip_profit_pts = MIN_FLIP_PROFIT_PTS,   # from config.py
     ),
 }
 
