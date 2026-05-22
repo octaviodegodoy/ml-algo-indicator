@@ -6,7 +6,7 @@ import MetaTrader5 as mt5
 
 from config import (
     TARGETS,
-    TRADE_ENABLED, TRADE_BOTH_SIDES,
+    TRADE_ENABLED, ML_ENABLED, TRADE_BOTH_SIDES,
     RISK_PCT, MAX_SLIPPAGE, MAGIC_NUMBER,
     TRAIL_ACTIVATE_PCT,
     GRID_ENABLED, GRID_MAX_LEVELS, GRID_STEP_MULT, GRID_PORTFOLIO_SL_MULT,
@@ -171,8 +171,8 @@ def _validate_stops(price: float, sl: float, tp: float, order_type: int, info) -
 
 # ── Signal-driven order execution ─────────────────────────────────────────────
 def execute_trade(symbol: str, current_signal: int, sl_price_units: float) -> None:
-    """Send an order when signal transitions; respects TRADE_ENABLED flag."""
-    if not TRADE_ENABLED:
+    """Send an order when signal transitions; respects TRADE_ENABLED and ML_ENABLED flags."""
+    if not TRADE_ENABLED or not ML_ENABLED:
         return
     prev_signal = _last_exec_signal.get(symbol, -1)
     if current_signal == prev_signal:
@@ -259,7 +259,7 @@ def manage_trailing_stops() -> None:
     reaches TRAIL_ACTIVATE_PCT × initial SL distance. The SL follows price at
     the same fixed distance, never moving against the trade.
     """
-    if not TRADE_ENABLED:
+    if not TRADE_ENABLED or not ML_ENABLED:
         return
     for t in TARGETS:
         symbol    = t['symbol']

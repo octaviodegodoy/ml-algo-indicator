@@ -13,19 +13,19 @@ from config import TF_SECONDS, HTF_BARS, MIN_MICRO_ROWS, dom_path, ticks_path
 
 
 # ── Low-level indicator helpers ───────────────────────────────────────────────
-def _atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
+def _atr(df: pd.DataFrame, n: int = 14, min_periods: int = 1) -> pd.Series:
     tr = pd.concat([
         (df['High'] - df['Low']),
         (df['High'] - df['Close'].shift()).abs(),
         (df['Low']  - df['Close'].shift()).abs(),
     ], axis=1).max(axis=1)
-    return tr.rolling(n).mean()
+    return tr.rolling(n, min_periods=min_periods).mean()
 
 
-def _rsi(close: pd.Series, n: int = 14) -> pd.Series:
+def _rsi(close: pd.Series, n: int = 14, min_periods: int = 1) -> pd.Series:
     delta = close.diff()
-    gain  = delta.clip(lower=0).rolling(n).mean()
-    loss  = (-delta.clip(upper=0)).rolling(n).mean()
+    gain  = delta.clip(lower=0).rolling(n, min_periods=min_periods).mean()
+    loss  = (-delta.clip(upper=0)).rolling(n, min_periods=min_periods).mean()
     rs    = gain / loss.replace(0, np.nan)
     return 100 - 100 / (1 + rs)
 
@@ -176,13 +176,79 @@ def add_vwap_features(out: pd.DataFrame, df: pd.DataFrame, atr14: pd.Series) -> 
     return out
 
 
+# ── Opening Range Breakout (ORB) features ─────────────────────────────────────
+def make_orb_features(df: pd.DataFrame, orb_bars: int = 3) -> pd.DataFrame:
+    """
+    Opening Range Breakout features from the first `orb_bars` M5 bars per day
+    (default = 3 bars = first 15 minutes of the session).
+
+    Features:
+      orb_range_atr   — ORB width in ATR units (how wide the opening range is)
+      orb_position    — (close − orb_low) / orb_range  (0 = at low, 1 = at high)
+      orb_dist_high   — distance above ORB high in ATR units (+ = above)
+      orb_dist_low    — distance above ORB low  in ATR units (+ = above)
+      orb_broken_up   — 1 if close > orb_high (bullish ORB breakout)
+      orb_broken_down — 1 if close < orb_low  (bearish ORB breakout)
+
+    All features are NaN for bars within the ORB formation window itself.
+    """
+    out      = pd.DataFrame(index=df.index)
+    atr14    = _atr(df, 14).replace(0, np.nan)
+    date_key = df.index.normalize()
+    bar_seq  = df.groupby(date_key).cumcount()   # 0-based bar index within each day
+
+    # ORB window: first orb_bars bars per day
+    orb_window   = df[bar_seq < orb_bars]
+    day_orb_high = orb_window.groupby(orb_window.index.normalize())['High'].max()
+    day_orb_low  = orb_window.groupby(orb_window.index.normalize())['Low'].min()
+
+    # Broadcast daily ORB values back onto every bar of that day
+    orb_high  = day_orb_high.reindex(date_key).set_axis(df.index)
+    orb_low   = day_orb_low.reindex(date_key).set_axis(df.index)
+    orb_range = (orb_high - orb_low).replace(0, np.nan)
+
+    close = df['Close']
+    out['orb_range_atr']   = orb_range / atr14
+    out['orb_position']    = (close - orb_low) / orb_range
+    out['orb_dist_high']   = (close - orb_high) / atr14
+    out['orb_dist_low']    = (close - orb_low)  / atr14
+    out['orb_broken_up']   = (close > orb_high).astype(float)
+    out['orb_broken_down'] = (close < orb_low).astype(float)
+
+    # NaN out rows within the ORB formation window (not yet a valid signal)
+    out.loc[bar_seq < orb_bars] = np.nan
+    return out
+
+
 # ── Higher-timeframe (H1) context features ────────────────────────────────────
 def make_htf_features(htf_bars: Optional[pd.DataFrame], bars_m5: pd.DataFrame) -> pd.DataFrame:
     """Compute H1 context features from pre-fetched bars and forward-fill onto the M5 index.
 
     Accepts a pre-fetched DataFrame (from mt5_client.fetch_htf_bars) instead of calling MT5
     directly, so the feature-engineering layer has no platform dependency (DIP).
+    Falls back to resampling bars_m5 → H1 when the broker has no H1 history for the
+    new contract (e.g. first few days after a roll).
     """
+    if htf_bars is None or htf_bars.empty:
+        htf_bars = None  # force M5 resample below
+
+    # If MT5 H1 history doesn't reach back to the start of bars_m5 (new contract
+    # roll), supplement or replace with H1 bars resampled from M5.
+    m5_h1 = None
+    if htf_bars is None or htf_bars.index[0] > bars_m5.index[0]:
+        m5_h1 = bars_m5.resample('1h').agg(
+            Open=('Open', 'first'), High=('High', 'max'),
+            Low=('Low', 'min'),    Close=('Close', 'last'),
+            Volume=('Volume', 'sum'),
+        ).dropna(subset=['Close'])
+        if htf_bars is not None and not htf_bars.empty:
+            # Blend: M5-derived for the historical gap, MT5 H1 for recent bars
+            htf_bars = pd.concat(
+                [m5_h1[m5_h1.index < htf_bars.index[0]], htf_bars]
+            ).sort_index()
+        else:
+            htf_bars = m5_h1
+
     if htf_bars is None or htf_bars.empty:
         return pd.DataFrame(index=bars_m5.index)
     df = htf_bars
@@ -190,10 +256,10 @@ def make_htf_features(htf_bars: Optional[pd.DataFrame], bars_m5: pd.DataFrame) -
     htf = pd.DataFrame(index=df.index)
     htf['h1_ret_1']      = df['Close'].pct_change(1)
     htf['h1_ret_4']      = df['Close'].pct_change(4)
-    htf['h1_rsi_14']     = _rsi(df['Close'], 14)
-    htf['h1_ma20_dist']  = (df['Close'] - df['Close'].rolling(20).mean()) / \
-                            df['Close'].rolling(20).mean().replace(0, np.nan)
-    htf['h1_atr_norm']   = _atr(df, 14) / df['Close'].replace(0, np.nan)
+    htf['h1_rsi_14']     = _rsi(df['Close'], 14, min_periods=3)
+    htf['h1_ma20_dist']  = (df['Close'] - df['Close'].rolling(20, min_periods=5).mean()) / \
+                            df['Close'].rolling(20, min_periods=5).mean().replace(0, np.nan)
+    htf['h1_atr_norm']   = _atr(df, 14, min_periods=3) / df['Close'].replace(0, np.nan)
     htf['h1_body_ratio'] = (df['Close'] - df['Open']) / \
                             (df['High'] - df['Low']).replace(0, np.nan)
     return htf.shift(1).reindex(bars_m5.index, method='ffill')

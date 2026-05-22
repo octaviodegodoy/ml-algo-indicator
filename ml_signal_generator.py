@@ -30,9 +30,10 @@ from config import (
     TARGETS, TIMEFRAME, N_BARS,
     TB_MAX_BARS, TB_PT_MULT, TB_SL_MULT,
     PROB_THRESHOLD, N_SPLITS_CV, MIN_MICRO_ROWS,
-    FREEZE_HISTORY, TRADE_ENABLED, TRADE_SESSIONS, out_path,
+    FREEZE_HISTORY, TRADE_ENABLED, TRADE_SESSIONS, out_path, orb_path,
     MIN_AUC, COOLDOWN_BARS, DAILY_MAX_LOSS_PCT, MODEL_TYPE,
     REQUIRE_DI_CONFIRMATION, DI_CONFIRM_MIN_DIFF, SELL_PERSISTENCE_BARS,
+    ORB_BARS, ORB_ENABLED, ORB_SESSION_END,
 )
 from mt5_client import mt5_setup, fetch_bars, fetch_htf_bars
 from microstructure import append_dom_snapshot, fetch_and_aggregate_ticks
@@ -45,11 +46,33 @@ from model import (
     evaluate_walkforward, compute_sl_points, _make_classifier,
 )
 from trade import execute_trade, manage_trailing_stops, manage_grid_orders, init_signal_state
+from orb_trade import process_orb, close_orb_positions
 
 
 # ── Signal persistence buffer (per symbol, last 2 evaluations) ───────────────
 _signal_buffer: dict = {}    # symbol → deque(maxlen=2)
 _cooldown_counter: dict = {} # symbol → int (bars remaining before re-entry allowed)
+
+# ── ORB helper ────────────────────────────────────────────────────────────────
+# ORB_BARS is imported from config; _write_orb_csv uses it for the CSV the indicator reads.
+
+def _write_orb_csv(slug: str, bars: pd.DataFrame) -> None:
+    """Write today's ORB high/low/mid to MQL5/Files/<slug>_orb.csv."""
+    # Broker bars are tagged as UTC but represent BRT; use the raw date directly.
+    today = pd.Timestamp.now().normalize()   # matches broker date convention
+    today_bars = bars[bars.index.normalize() == today]
+    if len(today_bars) < ORB_BARS:
+        return   # ORB not yet formed — do not overwrite stale file with partial data
+    window   = today_bars.iloc[:ORB_BARS]
+    orb_high = float(window['High'].max())
+    orb_low  = float(window['Low'].min())
+    orb_mid  = round((orb_high + orb_low) / 2.0, 1)
+    pd.DataFrame({
+        'orb_high': [orb_high],
+        'orb_low':  [orb_low],
+        'orb_mid':  [orb_mid],
+        'orb_bars': [ORB_BARS],
+    }).to_csv(orb_path(slug), index=False)
 
 _BRT = timezone(timedelta(hours=-3))
 
@@ -93,6 +116,12 @@ def process_target(target: dict) -> None:
     if bars is None:
         print(f"[{symbol}] no bars")
         return
+
+    # 2b. ORB — write high/low for today's opening range (consumed by the indicator)
+    _write_orb_csv(slug, bars)
+
+    # 2c. ORB trade — detect breakout and fire order (at most once per direction per day)
+    process_orb(symbol, bars)
 
     # 3. Features
     feats = make_features(bars)
@@ -286,6 +315,14 @@ def run_once() -> None:
     if _equity > 0 and daily_pnl <= _daily_loss_limit:
         print(f"[{now}] Daily loss circuit breaker: P&L={daily_pnl:.2f} ≤ {_daily_loss_limit:.2f} ({DAILY_MAX_LOSS_PCT}% of equity {_equity:.2f}). No new entries today.")
         return
+
+    # ORB EOD sweep — close any open ORB positions when the session window has ended
+    _now_brt = datetime.now(_BRT)
+    _after_orb = ORB_ENABLED and (_now_brt.hour, _now_brt.minute) >= ORB_SESSION_END
+    if _after_orb:
+        for t in TARGETS:
+            close_orb_positions(t["symbol"])
+
     for t in TARGETS:
         try:
             process_target(t)

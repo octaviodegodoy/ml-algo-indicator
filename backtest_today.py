@@ -35,7 +35,7 @@ from lightgbm import LGBMClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 
-from features import _atr, add_time_features, make_features, make_htf_features
+from features import _atr, add_time_features, make_features, make_htf_features, make_orb_features
 from model import (
     compute_recency_weights,
     evaluate_walkforward,
@@ -45,7 +45,8 @@ from mt5_client import fetch_bars, fetch_htf_bars, mt5_setup
 from config import (
     N_BARS, PROB_THRESHOLD, RECENCY_DECAY,
     TB_SL_MULT, TB_PT_MULT, TB_MAX_BARS,
-    MIN_AUC, TRADE_SESSIONS, TIMEFRAME,
+    MIN_AUC, TRADE_SESSIONS, TIMEFRAME, MIN_FLIP_PROFIT_PTS, orb_path,
+    ORB_BARS, ORB_SL_MULT, ORB_TP_MULT, ORB_SESSION_START, ORB_SESSION_END, ORB_TRADE_SHORT,
 )
 
 # ── Simulation constants ─────────────────────────────────────────────
@@ -99,6 +100,21 @@ PARAMS = {
         use_quality_gate    = True,
         min_flip_profit_pts = MIN_FLIP_PROFIT_PTS,   # from config.py
     ),
+    # Opening Range Breakout: trade only 09:05–10:30 BRT (first ~90 min of session).
+    # No persistence filter — the opening move is fast and 2-bar lag misses the entry.
+    # Tighter SL (0.7×ATR) because early-session ATR reflects prior-day volatility;
+    # wider PT (2.0×ATR) to ride the directional impulse.
+    "OPEN_ORB": dict(
+        prob_threshold      = 0.45,
+        recency_decay       = RECENCY_DECAY,
+        sl_mult             = 0.7,
+        pt_mult             = 2.0,
+        max_bars            = TB_MAX_BARS,
+        use_persistence     = False,
+        use_quality_gate    = True,
+        min_flip_profit_pts = 0,
+        sessions            = [((9, 5), (10, 30))],  # opening window only
+    ),
 }
 
 
@@ -118,6 +134,9 @@ def train_and_score(bars_train: pd.DataFrame, bars_test: pd.DataFrame, p: dict):
     htf_train   = make_htf_features(fetch_htf_bars(SYMBOL), bars_train)
     if not htf_train.empty:
         feats_train = pd.concat([feats_train, htf_train], axis=1)
+    orb_train = make_orb_features(bars_train)
+    if not orb_train.empty:
+        feats_train = pd.concat([feats_train, orb_train], axis=1)
 
     aligned = pd.concat([feats_train, labels], axis=1).dropna(subset=["y"])
     aligned = aligned.dropna(thresh=int(len(feats_train.columns) * 0.6))
@@ -166,6 +185,9 @@ def train_and_score(bars_train: pd.DataFrame, bars_test: pd.DataFrame, p: dict):
     htf_test   = make_htf_features(fetch_htf_bars(SYMBOL), bars_test)
     if not htf_test.empty:
         feats_test = pd.concat([feats_test, htf_test], axis=1)
+    orb_test = make_orb_features(bars_test)
+    if not orb_test.empty:
+        feats_test = pd.concat([feats_test, orb_test], axis=1)
     feats_test = feats_test.reindex(columns=X_train.columns, fill_value=np.nan)
 
     proba      = model.predict_proba(feats_test)[:, 1]
@@ -215,15 +237,23 @@ def _in_session(ts) -> bool:
 
 
 def simulate_pnl(bars_test: pd.DataFrame, signal_series: pd.Series, sl_mult: float,
-                 atr_all: pd.Series = None):
+                 atr_all: pd.Series = None, sessions=None):
     """
     Walk through today's bars and simulate trades.
     Entry / exit are at the close of the triggering bar (conservative).
     SL = sl_mult × ATR(14) computed from the full bar history (atr_all) so the
     first in-session bar isn't blocked by the 14-bar ATR warmup period.
-    Only opens new trades within TRADE_SESSIONS (mirrors live generator).
+    Only opens new trades within `sessions` (defaults to TRADE_SESSIONS from config).
     Returns (trades_df, summary_dict).
     """
+    active_sessions = sessions if sessions is not None else TRADE_SESSIONS
+
+    def _in_sess(ts) -> bool:
+        t = (ts.hour, ts.minute)
+        for start, end in active_sessions:
+            if start <= t <= end:
+                return True
+        return False
     # Use full-history ATR when provided; fall back to test-only ATR (has NaN warmup)
     if atr_all is not None:
         atr_test = atr_all.reindex(bars_test.index)
@@ -283,8 +313,8 @@ def simulate_pnl(bars_test: pd.DataFrame, signal_series: pd.Series, sl_mult: flo
 
         # Open a trade whenever we have a confirmed signal and are flat
         # (retry every bar so NaN ATR at warm-up doesn't permanently block entry)
-        # Session gate: only open new entries within TRADE_SESSIONS
-        if not in_trade and _in_session(ts):
+        # Session gate: only open new entries within active_sessions
+        if not in_trade and _in_sess(ts):
             atr_val = float(atr_test.get(ts, np.nan))
             if not np.isnan(c) and not np.isnan(atr_val) and atr_val > 0:
                 entry_price = c
@@ -305,6 +335,143 @@ def simulate_pnl(bars_test: pd.DataFrame, signal_series: pd.Series, sl_mult: flo
     if df.empty:
         return df, dict(n_trades=0, net_brl=0.0, win_rate=0.0, avg_pnl=0.0, best=0.0, worst=0.0)
 
+    n_win = (df["net_brl"] > 0).sum()
+    summary = dict(
+        n_trades = len(df),
+        net_brl  = df["net_brl"].sum(),
+        win_rate = n_win / len(df),
+        avg_pnl  = df["net_brl"].mean(),
+        best     = df["net_brl"].max(),
+        worst    = df["net_brl"].min(),
+    )
+    return df, summary
+
+
+# ── Pure ORB simulation ──────────────────────────────────────────────────────
+def simulate_orb_pnl(bars_today: pd.DataFrame) -> tuple:
+    """
+    Simulate the pure price-action ORB strategy matching orb_trade.py exactly.
+
+    Rules:
+      - Opening range = High/Low of today's first ORB_BARS M5 bars.
+      - After ORB_SESSION_START, enter BUY on first close > orb_high.
+      - After ORB_SESSION_START, enter SELL on first close < orb_low (if ORB_TRADE_SHORT).
+      - SL = entry ± ORB_SL_MULT × range;  TP = entry ± ORB_TP_MULT × range.
+      - At most one trade per direction per day; EOD close if neither SL nor TP hit.
+    Returns (trades_df, summary_dict).
+    """
+    _empty = dict(n_trades=0, net_brl=0.0, win_rate=0.0, avg_pnl=0.0, best=0.0, worst=0.0)
+    if len(bars_today) < ORB_BARS:
+        print("    ORB not formed (fewer than ORB_BARS bars today)")
+        return pd.DataFrame(), _empty
+
+    window    = bars_today.iloc[:ORB_BARS]
+    orb_high  = float(window["High"].max())
+    orb_low   = float(window["Low"].min())
+    orb_range = orb_high - orb_low
+    if orb_range <= 0:
+        print("    ORB range is zero — skipping")
+        return pd.DataFrame(), _empty
+
+    sl_pts = orb_range * ORB_SL_MULT
+    tp_pts = orb_range * ORB_TP_MULT
+    print(
+        f"    ORB=[{orb_low:.0f}\u2013{orb_high:.0f}]  range={orb_range:.0f}p"
+        f"  SL={sl_pts:.0f}p  TP={tp_pts:.0f}p  R:R={tp_pts/sl_pts:.1f}"
+    )
+
+    def _in_orb_sess(ts) -> bool:
+        hm = (ts.hour, ts.minute)
+        return ORB_SESSION_START <= hm < ORB_SESSION_END
+
+    trades:     list = []
+    buy_done  = False
+    sell_done = False
+    active_buy:  dict | None = None   # {'entry', 'sl', 'tp', 'time'}
+    active_sell: dict | None = None
+
+    for ts, row in bars_today.iterrows():
+        h = float(row["High"])
+        l = float(row["Low"])
+        c = float(row["Close"])
+
+        # ── Check SL / TP on open BUY ────────────────────────────────────────
+        if active_buy is not None:
+            if l <= active_buy["sl"]:
+                pts = active_buy["sl"] - active_buy["entry"]
+                trades.append(dict(
+                    entry_time=active_buy["time"], exit_time=ts,
+                    direction="LONG", entry=active_buy["entry"],
+                    exit_price=active_buy["sl"],
+                    pnl_pts=pts, net_brl=pts * LOTS * TICK_VALUE - COMMISSION, reason="SL",
+                ))
+                active_buy = None
+            elif h >= active_buy["tp"]:
+                pts = active_buy["tp"] - active_buy["entry"]
+                trades.append(dict(
+                    entry_time=active_buy["time"], exit_time=ts,
+                    direction="LONG", entry=active_buy["entry"],
+                    exit_price=active_buy["tp"],
+                    pnl_pts=pts, net_brl=pts * LOTS * TICK_VALUE - COMMISSION, reason="TP",
+                ))
+                active_buy = None
+
+        # ── Check SL / TP on open SELL ───────────────────────────────────────
+        if active_sell is not None:
+            if h >= active_sell["sl"]:
+                pts = active_sell["entry"] - active_sell["sl"]
+                trades.append(dict(
+                    entry_time=active_sell["time"], exit_time=ts,
+                    direction="SHORT", entry=active_sell["entry"],
+                    exit_price=active_sell["sl"],
+                    pnl_pts=pts, net_brl=pts * LOTS * TICK_VALUE - COMMISSION, reason="SL",
+                ))
+                active_sell = None
+            elif l <= active_sell["tp"]:
+                pts = active_sell["entry"] - active_sell["tp"]
+                trades.append(dict(
+                    entry_time=active_sell["time"], exit_time=ts,
+                    direction="SHORT", entry=active_sell["entry"],
+                    exit_price=active_sell["tp"],
+                    pnl_pts=pts, net_brl=pts * LOTS * TICK_VALUE - COMMISSION, reason="TP",
+                ))
+                active_sell = None
+
+        # ── New entry gate ────────────────────────────────────────────────────
+        if not _in_orb_sess(ts):
+            continue
+
+        # ── BUY breakout ──────────────────────────────────────────────────────
+        if not buy_done and active_buy is None and c > orb_high:
+            entry = c
+            active_buy = {"entry": entry, "sl": entry - sl_pts, "tp": entry + tp_pts, "time": ts}
+            buy_done = True
+            print(f"    ORB BUY  @ {entry:.0f}  SL={active_buy['sl']:.0f}  TP={active_buy['tp']:.0f}")
+
+        # ── SELL breakout ─────────────────────────────────────────────────────
+        if ORB_TRADE_SHORT and not sell_done and active_sell is None and c < orb_low:
+            entry = c
+            active_sell = {"entry": entry, "sl": entry + sl_pts, "tp": entry - tp_pts, "time": ts}
+            sell_done = True
+            print(f"    ORB SELL @ {entry:.0f}  SL={active_sell['sl']:.0f}  TP={active_sell['tp']:.0f}")
+
+    # ── EOD close ─────────────────────────────────────────────────────────────
+    last_ts    = bars_today.index[-1]
+    last_price = float(bars_today["Close"].iloc[-1])
+    for pos, direction in [(active_buy, "LONG"), (active_sell, "SHORT")]:
+        if pos is None:
+            continue
+        pts = (last_price - pos["entry"]) if direction == "LONG" else (pos["entry"] - last_price)
+        trades.append(dict(
+            entry_time=pos["time"], exit_time=last_ts,
+            direction=direction, entry=pos["entry"],
+            exit_price=last_price,
+            pnl_pts=pts, net_brl=pts * LOTS * TICK_VALUE - COMMISSION, reason="EOD",
+        ))
+
+    df = pd.DataFrame(trades)
+    if df.empty:
+        return df, _empty
     n_win = (df["net_brl"] > 0).sum()
     summary = dict(
         n_trades = len(df),
@@ -348,6 +515,16 @@ def main():
     print(f"Training bars : {len(bars_train)}")
     print(f"Today's bars  : {len(bars_today)}")
 
+    # Write ORB CSV so the indicator shows today's opening range immediately
+    if len(bars_today) >= ORB_BARS:
+        window   = bars_today.iloc[:ORB_BARS]
+        orb_high = float(window['High'].max())
+        orb_low  = float(window['Low'].min())
+        orb_mid  = round((orb_high + orb_low) / 2.0, 1)
+        pd.DataFrame({'orb_high': [orb_high], 'orb_low': [orb_low], 'orb_mid': [orb_mid], 'orb_bars': [ORB_BARS]})\
+          .to_csv(orb_path('win'), index=False)
+        print(f"ORB  high={orb_high:.0f}  low={orb_low:.0f}  mid={orb_mid:.0f}  (first {ORB_BARS} bars)")
+
     # Pre-compute ATR from full history so today's simulation isn't blocked by 14-bar warmup
     atr_full = _atr(all_bars, 14)
 
@@ -379,7 +556,10 @@ def main():
             f"buy_bars={n_buy}  sell_bars={n_sell}  undecided={int((signals==-1).sum())}"
         )
 
-        trades_df, summary = simulate_pnl(bars_today, signals, p["sl_mult"], atr_all=atr_full)
+        trades_df, summary = simulate_pnl(
+            bars_today, signals, p["sl_mult"],
+            atr_all=atr_full, sessions=p.get("sessions"),
+        )
         results_map[label] = summary
         trades_map[label]  = trades_df
         print(
@@ -390,34 +570,56 @@ def main():
             f"Best=R${summary['best']:.2f}  "
             f"Worst=R${summary['worst']:.2f}"
         )
-
+    # ── Pure ORB simulation (price-action, no ML) ─────────────────────────────
+    print(f"\n{'─'*52}")
+    print(
+        f"  [ORB_PURE]  pure price-action ORB"
+        f"  sl_mult={ORB_SL_MULT}  tp_mult={ORB_TP_MULT}"
+        f"  session={ORB_SESSION_START}\u2013{ORB_SESSION_END}"
+    )
+    orb_pure_trades, orb_pure_summary = simulate_orb_pnl(bars_today)
+    results_map["ORB_PURE"] = orb_pure_summary
+    trades_map["ORB_PURE"]  = orb_pure_trades
+    metrics_map["ORB_PURE"] = {}
+    print(
+        f"    Trades={orb_pure_summary['n_trades']}  "
+        f"Net=R${orb_pure_summary['net_brl']:.2f}  "
+        f"Win={orb_pure_summary['win_rate']:.0%}  "
+        f"Avg=R${orb_pure_summary['avg_pnl']:.2f}  "
+        f"Best=R${orb_pure_summary['best']:.2f}  "
+        f"Worst=R${orb_pure_summary['worst']:.2f}"
+    )
     mt5.shutdown()
 
     # ── Summary table ──────────────────────────────────────────────────────────
     dbl  = "\u2550"
     dash = "-"
     arr  = "OLD\u2192NEW"
-    print(f"\n{dbl*72}")
+    orb_v  = results_map.get("OPEN_ORB", {})
+    orbp_v = results_map.get("ORB_PURE", {})
+    print(f"\n{dbl*93}")
     print(f"  RESULTS  —  {today_str}  |  {SYMBOL} M5  |  {LOTS} lot  |  comm=R${COMMISSION:.2f}/RT")
-    print(f"{dbl*72}")
-    print(f"  {'Metric':<22} {'BASELINE':>12} {'OLD':>12} {'NEW':>12}  {arr:>10}")
-    print(f"  {dash*68}")
+    print(f"{dbl*93}")
+    print(f"  {'Metric':<22} {'BASELINE':>12} {'OLD':>12} {'NEW':>12} {'OPEN_ORB':>12} {'ORB_PURE':>12}  {arr:>10}")
+    print(f"  {dash*89}")
     for k in ["n_trades", "net_brl", "win_rate", "avg_pnl", "best", "worst"]:
         bv = results_map["BASELINE"].get(k, 0)
         ov = results_map["OLD"].get(k, 0)
         nv = results_map["NEW"].get(k, 0)
+        rv = orb_v.get(k, 0)
+        pv = orbp_v.get(k, 0)
         delta = nv - ov
         if k == "win_rate":
-            print(f"  {k:<22} {bv:>11.1%} {ov:>11.1%} {nv:>11.1%}  {delta:>+10.1%}")
+            print(f"  {k:<22} {bv:>11.1%} {ov:>11.1%} {nv:>11.1%} {rv:>11.1%} {pv:>11.1%}  {delta:>+10.1%}")
         elif k == "n_trades":
-            print(f"  {k:<22} {int(bv):>12} {int(ov):>12} {int(nv):>12}  {int(delta):>+10}")
+            print(f"  {k:<22} {int(bv):>12} {int(ov):>12} {int(nv):>12} {int(rv):>12} {int(pv):>12}  {int(delta):>+10}")
         else:
-            print(f"  {k:<22} {bv:>12.2f} {ov:>12.2f} {nv:>12.2f}  {delta:>+10.2f}")
-    print(f"{dbl*72}")
+            print(f"  {k:<22} {bv:>12.2f} {ov:>12.2f} {nv:>12.2f} {rv:>12.2f} {pv:>12.2f}  {delta:>+10.2f}")
+    print(f"{dbl*93}")
     print(f"  Actual today (CSV):   net=R$29.00  trades=21  (multi-lot, grid included)")
 
     # ── Trade-by-trade detail ──────────────────────────────────────────────────
-    for label in ["OLD", "NEW"]:
+    for label in ["OLD", "NEW", "OPEN_ORB", "ORB_PURE"]:
         df = trades_map[label]
         if df.empty:
             continue
@@ -432,7 +634,7 @@ def main():
             )
 
     # ── Plot ───────────────────────────────────────────────────────────────────
-    plot_labels = [k for k in PARAMS if k != "BASELINE"]
+    plot_labels = [k for k in PARAMS if k != "BASELINE"] + ["ORB_PURE"]
     n_panels    = len(plot_labels)
     fig, axes = plt.subplots(
         n_panels + 1, 1, figsize=(15, 4 + 3 * n_panels), sharex=True,
@@ -452,7 +654,7 @@ def main():
     ax_price.grid(alpha=0.3)
     ax_price.legend(loc="upper left", fontsize=8)
 
-    color_map = {"OLD": "crimson", "NEW": "seagreen"}
+    color_map = {"OLD": "crimson", "NEW": "seagreen", "OPEN_ORB": "darkorange", "ORB_PURE": "mediumpurple"}
 
     for label, ax in panel_axes.items():
         df  = trades_map.get(label, pd.DataFrame())

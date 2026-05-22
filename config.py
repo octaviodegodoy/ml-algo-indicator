@@ -21,14 +21,14 @@ N_BARS            = 15000
 
 # ── Triple-barrier params (in ATR multiples) ──────────────────────────────────
 TB_MAX_BARS       = 8           # vertical barrier: ~1 hour on M5
-TB_PT_MULT        = 1.5          # profit target = 1.5 × ATR(14)
+TB_PT_MULT        = 2.0          # profit target = 2.0 × ATR(14)  — improved R:R from 1.25:1 to 1.67:1
 TB_SL_MULT        = 1.2          # stop loss    = 1.2 × ATR(14)  (widened to survive noise)
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 # 'lightgbm' (default, faster) or 'xgboost' (level-wise, more conservative on noisy labels)
-MODEL_TYPE        = 'xgboost'
-PROB_THRESHOLD    = 0.45         # raised from 0.35 — fewer, higher-confidence signals to protect win-rate margin
-MIN_AUC           = 0.46         # lowered: CV walk-forward AUC ≈ 0.47–0.48 while live win rate is 76%; CV metric underestimates live performance
+MODEL_TYPE        = 'lightgbm'
+PROB_THRESHOLD    = 0.52         # only enter when model assigns >52% probability (above random)
+MIN_AUC           = 0.52         # require walk-forward AUC above random (0.5) before trading
 DAILY_MAX_LOSS_PCT = -2.0           # stop new entries when realized day P&L drops below this % of equity
 INTERVAL_SECONDS  = 60
 N_SPLITS_CV       = 5
@@ -71,23 +71,39 @@ FREEZE_HISTORY    = True
 
 # ── Trade execution ───────────────────────────────────────────────────────────
 # SAFETY: keep TRADE_ENABLED = False until you have verified signals visually.
-TRADE_ENABLED      = True   # set True to allow real orders
-TRADE_BOTH_SIDES   = True   # True  = signal 1 → long, signal 0 → short
-                              # False = signal 1 → long, signal 0 → close long only
+TRADE_ENABLED      = True   # master switch — gates ALL order placing (ML + ORB)
+ML_ENABLED         = True   # set False to disable ML trades and run ORB only
+# ORB_ENABLED (below) is the equivalent switch for the ORB strategy.
+TRADE_BOTH_SIDES   = True  # signal 1 → long, signal 0 → close long only (M5 shorts on WIN add noise)
 RISK_PCT           = 2.0   # % of account balance risked per trade
 MAX_SLIPPAGE       = 10     # maximum allowed slippage in points
 MAGIC_NUMBER       = 20260507  # unique tag for orders placed by this script
-TRAIL_ACTIVATE_PCT = 0.20   # activate trailing stop when profit >= 20% of SL distance (~50 pts)
+TRAIL_ACTIVATE_PCT = 0.40   # activate trailing stop when profit >= 40% of SL distance (wider to avoid noise stop-out)
 MIN_FLIP_PROFIT_PTS = 0     # disabled — backtest showed no gain from suppressing signal-flip exits
 
 # ── Grid (Fibonacci martingale) ───────────────────────────────────────────────
-GRID_ENABLED           = True   # seed + grid total volume capped to RISK_PCT budget via _grid_divisor()
+GRID_ENABLED           = False  # DISABLED: Fibonacci martingale amplifies losses when model is wrong
 GRID_MAX_LEVELS        = 5      # maximum grid add-ons per seed position
 GRID_STEP_MULT         = 0.50   # grid step = GRID_STEP_MULT × SL-distance in adverse direction
                                  # raised from 0.30 — less aggressive averaging-down
 GRID_PORTFOLIO_SL_MULT = 3.50   # close entire grid when total floating loss exceeds
                                  # this multiple of (seed_sl_dist × point_value × seed_lot)
                                  # lowered from 5.00 — tighter total grid exposure cap
+
+# ── ORB (Opening Range Breakout) strategy ─────────────────────────────────────
+# First ORB_BARS M5 bars each day define the range (09:00–09:14 BRT by default).
+# After ORB_SESSION_START a close above ORB high triggers a BUY; a close below
+# ORB low triggers a SELL (if ORB_TRADE_SHORT=True).  At most one trade per
+# direction per calendar day.  TP is fixed on the order; no trailing stop needed.
+ORB_ENABLED       = True
+ORB_BARS          = 3           # number of M5 bars in the opening range (3 × 5 min = 15 min)
+ORB_SESSION_START = (9, 15)     # BRT (h, m): earliest valid entry after ORB is formed
+ORB_SESSION_END   = (14, 0)     # BRT (h, m): no new ORB entries after this; EOD close sweep
+ORB_SL_MULT       = 0.5         # SL distance = ORB_SL_MULT × ORB range (placed from entry)
+ORB_TP_MULT       = 1.0         # TP distance = ORB_TP_MULT × ORB range → 2:1 R:R (TP/SL = 2)
+ORB_RISK_PCT      = 1.5         # % of account balance risked per ORB trade (separate budget)
+ORB_MAGIC         = 20260522    # unique magic number — never share with MAGIC_NUMBER
+ORB_TRADE_SHORT   = True        # True = also trade ORB downside breaks (SELL short)
 
 # ── Output paths ──────────────────────────────────────────────────────────────
 _files_dir = os.path.normpath(
@@ -99,5 +115,6 @@ os.makedirs(_files_dir, exist_ok=True)
 def out_path(slug: str)   -> str: return os.path.join(_files_dir, f'{slug}_ml_signals.csv')
 def dom_path(slug: str)   -> str: return os.path.join(_files_dir, f'{slug}_dom_snapshots.csv')
 def ticks_path(slug: str) -> str: return os.path.join(_files_dir, f'{slug}_tick_agg.csv')
+def orb_path(slug: str)   -> str: return os.path.join(_files_dir, f'{slug}_orb.csv')
 
 

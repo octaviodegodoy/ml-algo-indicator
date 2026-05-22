@@ -10,21 +10,32 @@ input string SignalFile         = "win_ml_signals.csv";
 input int    LookbackDays       = 1;     // how many days back to plot signals
 input int    RefreshSeconds     = 15;    // how often to re-read the CSV
 input bool   OnlyTransitions    = true;  // true = only plot 0->1 buys / 1->0 sells (recommended for M5)
-input double FilterMinProb      = 0.35;  // hide BUY arrows whose bar prob < this (match PROB_THRESHOLD in config.py)
-input double FilterMinPrecision = 0.46;  // CSV col 'Precision' stores ROC-AUC: hide signals when AUC < this (match MIN_AUC in config.py)
+input double FilterMinProb      = 0.52;  // hide BUY arrows whose bar prob < this (match PROB_THRESHOLD in config.py)
+input double FilterMinPrecision = 0.52;  // CSV col 'Precision' stores ROC-AUC: hide signals when AUC < this (match MIN_AUC in config.py)
 input double FilterMinEdge      = -99.0; // CSV col 'Edge' stores AUC-0.5; disabled (-99) — FilterMinPrecision already covers this
+
+// ── Opening Range Breakout (ORB) display ──────────────────────────────────
+// Python writes win_orb.csv each cycle with the first-3-bar range for today.
+input bool   ShowORB            = true;             // draw ORB High / Mid / Low lines
+input string ORBFile            = "win_orb.csv";    // must match orb_path(slug) in config.py
+input color  ORBHighColor       = clrDodgerBlue;    // ORB high breakout line colour
+input color  ORBLowColor        = clrOrangeRed;     // ORB low breakdown line colour
+input color  ORBMidColor        = clrDimGray;       // midpoint line colour
+input int    ORBLineWidth       = 2;                // line thickness
 
 //---
 int OnInit()
   {
    EventSetTimer(RefreshSeconds);
    PlotSignals(); // first attempt immediately
+   PlotORB();
    return INIT_SUCCEEDED;
   }
 
 void OnTimer()
   {
    PlotSignals();
+   PlotORB();
   }
 
 int OnCalculate(const int rates_total, const int prev_calculated,
@@ -33,7 +44,10 @@ int OnCalculate(const int rates_total, const int prev_calculated,
                 const long &tick_volume[], const long &volume[], const int &spread[])
   {
    if(prev_calculated == 0)
+     {
       PlotSignals();
+      PlotORB();
+     }
    return rates_total;
   }
 
@@ -44,6 +58,154 @@ void OnDeinit(const int reason)
    ObjectsDeleteAll(0, "SellSignal_");
    ObjectsDeleteAll(0, "SL_");
    ObjectsDeleteAll(0, "SLLine_");
+   ObjectsDeleteAll(0, "ORB_");
+  }
+
+//---
+// ══ Opening Range Breakout ════════════════════════════════════════════════════
+void PlotORB()
+  {
+   if(!ShowORB) return;
+
+   int fh = FileOpen(ORBFile, FILE_READ|FILE_TXT|FILE_ANSI);
+   if(fh == INVALID_HANDLE)
+     {
+      // File not written yet (Python hasn't run or ORB not formed).
+      // Do NOT delete existing lines — keep whatever was last drawn.
+      return;
+     }
+
+   // Skip header line
+   if(!FileIsEnding(fh)) FileReadString(fh);
+   if(FileIsEnding(fh))  { FileClose(fh); return; }
+
+   string line = FileReadString(fh);
+   FileClose(fh);
+   if(line == "") return;
+
+   string parts[];
+   if(StringSplit(line, ',', parts) < 2) return;
+
+   double orb_high = StringToDouble(parts[0]);
+   double orb_low  = StringToDouble(parts[1]);
+   double orb_mid  = (ArraySize(parts) >= 3) ? StringToDouble(parts[2])
+                                             : (orb_high + orb_low) / 2.0;
+   if(orb_high <= 0 || orb_low <= 0 || orb_high <= orb_low) return;
+
+   // Data is valid — now safe to redraw
+   ObjectsDeleteAll(0, "ORB_");
+
+   // ── ORB High ──────────────────────────────────────────────────────────────
+   if(ObjectCreate(0, "ORB_High", OBJ_HLINE, 0, 0, orb_high))
+     {
+      ObjectSetInteger(0, "ORB_High", OBJPROP_COLOR, ORBHighColor);
+      ObjectSetInteger(0, "ORB_High", OBJPROP_STYLE, STYLE_DASH);
+      ObjectSetInteger(0, "ORB_High", OBJPROP_WIDTH, ORBLineWidth);
+      ObjectSetString( 0, "ORB_High", OBJPROP_TEXT,
+                       "ORB High  " + DoubleToString(orb_high, 0));
+      ObjectSetInteger(0, "ORB_High", OBJPROP_BACK, true);
+      ObjectSetInteger(0, "ORB_High", OBJPROP_SELECTABLE, false);
+     }
+
+   // ── ORB Low ───────────────────────────────────────────────────────────────
+   if(ObjectCreate(0, "ORB_Low", OBJ_HLINE, 0, 0, orb_low))
+     {
+      ObjectSetInteger(0, "ORB_Low", OBJPROP_COLOR, ORBLowColor);
+      ObjectSetInteger(0, "ORB_Low", OBJPROP_STYLE, STYLE_DASH);
+      ObjectSetInteger(0, "ORB_Low", OBJPROP_WIDTH, ORBLineWidth);
+      ObjectSetString( 0, "ORB_Low", OBJPROP_TEXT,
+                       "ORB Low  " + DoubleToString(orb_low, 0));
+      ObjectSetInteger(0, "ORB_Low", OBJPROP_BACK, true);
+      ObjectSetInteger(0, "ORB_Low", OBJPROP_SELECTABLE, false);
+     }
+
+   // ── ORB Mid (50% equilibrium level) ──────────────────────────────────────
+   if(ObjectCreate(0, "ORB_Mid", OBJ_HLINE, 0, 0, orb_mid))
+     {
+      ObjectSetInteger(0, "ORB_Mid", OBJPROP_COLOR, ORBMidColor);
+      ObjectSetInteger(0, "ORB_Mid", OBJPROP_STYLE, STYLE_DOT);
+      ObjectSetInteger(0, "ORB_Mid", OBJPROP_WIDTH, 1);
+      ObjectSetString( 0, "ORB_Mid", OBJPROP_TEXT,
+                       "ORB Mid  " + DoubleToString(orb_mid, 0));
+      ObjectSetInteger(0, "ORB_Mid", OBJPROP_BACK, true);
+      ObjectSetInteger(0, "ORB_Mid", OBJPROP_SELECTABLE, false);
+     }
+
+   // ── ORB Breakout arrows ───────────────────────────────────────────────────
+   // Scan today's bars (after 09:15 BRT, once the 3-bar ORB is complete).
+   // Draw ONE arrow at the first bar whose close breaks above orb_high (BUY)
+   // or below orb_low (SELL).  Both directions are tracked independently.
+   {
+      string      sym = _Symbol;
+      ENUM_TIMEFRAMES tf = _Period;
+
+      // Build today's midnight timestamp (broker clock = BRT)
+      MqlDateTime nd;
+      TimeToStruct(TimeCurrent(), nd);
+      nd.hour = 0; nd.min = 0; nd.sec = 0;
+      datetime today_start = StructToTime(nd);
+
+      // Use a fixed 300-bar window so we never miss today's session even when
+      // iBarShift(midnight) returns -1 (no bar exists at midnight for intraday).
+      bool buy_drawn = false, sell_drawn = false;
+      int  scan_start = MathMin(300, Bars(sym, tf) - 1);
+
+      // Loop chronologically: high index = older, low index = newer
+      for(int i = scan_start; i >= 0; i--)
+        {
+         datetime bt = iTime(sym, tf, i);
+         if(bt < today_start) continue;            // pre-today bar, skip
+
+         MqlDateTime bdt;
+         TimeToStruct(bt, bdt);
+         // Ignore bars inside the 3-bar ORB formation window (09:00–09:14)
+         if(bdt.hour == 9 && bdt.min < 15) continue;
+
+         double c = iClose(sym, tf, i);
+
+         // ── First upside breakout ──────────────────────────────────────────
+         if(!buy_drawn && c > orb_high)
+           {
+            double ap = iLow(sym, tf, i) * 0.9994;
+            if(ObjectCreate(0, "ORB_BuyBreak", OBJ_ARROW, 0, bt, ap))
+              {
+               ObjectSetInteger(0, "ORB_BuyBreak", OBJPROP_ARROWCODE, 233);
+               ObjectSetInteger(0, "ORB_BuyBreak", OBJPROP_COLOR,     ORBHighColor);
+               ObjectSetInteger(0, "ORB_BuyBreak", OBJPROP_WIDTH,     3);
+               ObjectSetInteger(0, "ORB_BuyBreak", OBJPROP_BACK,      false);
+              }
+            ObjectCreate(0, "ORB_BuyLabel", OBJ_TEXT, 0, bt, ap * 0.9990);
+            ObjectSetString( 0, "ORB_BuyLabel", OBJPROP_TEXT,     "ORB+");
+            ObjectSetInteger(0, "ORB_BuyLabel", OBJPROP_COLOR,    ORBHighColor);
+            ObjectSetInteger(0, "ORB_BuyLabel", OBJPROP_FONTSIZE, 9);
+            ObjectSetInteger(0, "ORB_BuyLabel", OBJPROP_ANCHOR,   ANCHOR_TOP);
+            buy_drawn = true;
+           }
+
+         // ── First downside breakout ────────────────────────────────────────
+         if(!sell_drawn && c < orb_low)
+           {
+            double ap = iHigh(sym, tf, i) * 1.0006;
+            if(ObjectCreate(0, "ORB_SellBreak", OBJ_ARROW, 0, bt, ap))
+              {
+               ObjectSetInteger(0, "ORB_SellBreak", OBJPROP_ARROWCODE, 234);
+               ObjectSetInteger(0, "ORB_SellBreak", OBJPROP_COLOR,     ORBLowColor);
+               ObjectSetInteger(0, "ORB_SellBreak", OBJPROP_WIDTH,     3);
+               ObjectSetInteger(0, "ORB_SellBreak", OBJPROP_BACK,      false);
+              }
+            ObjectCreate(0, "ORB_SellLabel", OBJ_TEXT, 0, bt, ap * 1.0010);
+            ObjectSetString( 0, "ORB_SellLabel", OBJPROP_TEXT,     "ORB-");
+            ObjectSetInteger(0, "ORB_SellLabel", OBJPROP_COLOR,    ORBLowColor);
+            ObjectSetInteger(0, "ORB_SellLabel", OBJPROP_FONTSIZE, 9);
+            ObjectSetInteger(0, "ORB_SellLabel", OBJPROP_ANCHOR,   ANCHOR_BOTTOM);
+            sell_drawn = true;
+           }
+
+         if(buy_drawn && sell_drawn) break;
+        }
+   }
+
+   ChartRedraw(0);
   }
 
 //---
@@ -210,6 +372,15 @@ void PlotSignals()
 
    FileClose(fileHandle);
    ChartRedraw(0);
-   PrintFormat("CSV rows=%d  in window=%d  Buy=%d  Sell=%d",
-               totalRows, inWindow, buyCount, sellCount);
+
+   // Only log when something changes (avoids journal spam on every 15-s refresh)
+   static int s_lastTotal = -1, s_lastBuy = -1, s_lastSell = -1;
+   if(totalRows != s_lastTotal || buyCount != s_lastBuy || sellCount != s_lastSell)
+     {
+      PrintFormat("CSV rows=%d  in window=%d  Buy=%d  Sell=%d",
+                  totalRows, inWindow, buyCount, sellCount);
+      s_lastTotal = totalRows;
+      s_lastBuy   = buyCount;
+      s_lastSell  = sellCount;
+     }
   }
