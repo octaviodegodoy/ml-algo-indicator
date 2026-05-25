@@ -30,10 +30,11 @@ from config import (
     TARGETS, TIMEFRAME, N_BARS,
     TB_MAX_BARS, TB_PT_MULT, TB_SL_MULT,
     PROB_THRESHOLD, N_SPLITS_CV, MIN_MICRO_ROWS,
-    FREEZE_HISTORY, TRADE_ENABLED, TRADE_SESSIONS, out_path, orb_path,
+    FREEZE_HISTORY, TRADE_ENABLED, TRADE_SESSIONS, out_path, orb_path, gap_path,
     MIN_AUC, COOLDOWN_BARS, DAILY_MAX_LOSS_PCT, MODEL_TYPE,
     REQUIRE_DI_CONFIRMATION, DI_CONFIRM_MIN_DIFF, SELL_PERSISTENCE_BARS,
     ORB_BARS, ORB_ENABLED, ORB_SESSION_END,
+    GAP_ENABLED, GAP_ENTRY_END,
 )
 from mt5_client import mt5_setup, fetch_bars, fetch_htf_bars
 from microstructure import append_dom_snapshot, fetch_and_aggregate_ticks
@@ -47,6 +48,7 @@ from model import (
 )
 from trade import execute_trade, manage_trailing_stops, manage_grid_orders, init_signal_state
 from orb_trade import process_orb, close_orb_positions
+from gap_trade import process_gap, close_gap_positions, compute_gap
 
 
 # ── Signal persistence buffer (per symbol, last 2 evaluations) ───────────────
@@ -58,9 +60,10 @@ _cooldown_counter: dict = {} # symbol → int (bars remaining before re-entry al
 
 def _write_orb_csv(slug: str, bars: pd.DataFrame) -> None:
     """Write today's ORB high/low/mid to MQL5/Files/<slug>_orb.csv."""
-    # Broker bars are tagged as UTC but represent BRT; use the raw date directly.
+    # Broker bars are tagged as UTC but represent BRT; strip the tz label before
+    # comparing so the tz-naive `today` matches the tz-aware index correctly.
     today = pd.Timestamp.now().normalize()   # matches broker date convention
-    today_bars = bars[bars.index.normalize() == today]
+    today_bars = bars[bars.index.tz_localize(None).normalize() == today]
     if len(today_bars) < ORB_BARS:
         return   # ORB not yet formed — do not overwrite stale file with partial data
     window   = today_bars.iloc[:ORB_BARS]
@@ -73,6 +76,22 @@ def _write_orb_csv(slug: str, bars: pd.DataFrame) -> None:
         'orb_mid':  [orb_mid],
         'orb_bars': [ORB_BARS],
     }).to_csv(orb_path(slug), index=False)
+
+
+# ── Gap helper ────────────────────────────────────────────────────────────────
+def _write_gap_csv(slug: str, bars: pd.DataFrame) -> None:
+    """Write today's gap info (prev_close, today_open, gap_size, gap_dir) to MQL5/Files/<slug>_gap.csv."""
+    result = compute_gap(bars)
+    if result is None:
+        return
+    gap_size, today_open, prev_close, gap_dir = result
+    pd.DataFrame({
+        'prev_close': [prev_close],
+        'today_open': [today_open],
+        'gap_size':   [gap_size],
+        'gap_dir':    [gap_dir],
+    }).to_csv(gap_path(slug), index=False)
+
 
 _BRT = timezone(timedelta(hours=-3))
 
@@ -122,6 +141,10 @@ def process_target(target: dict) -> None:
 
     # 2c. ORB trade — detect breakout and fire order (at most once per direction per day)
     process_orb(symbol, bars)
+
+    # 2d. Gap Fill — write gap CSV for indicator; fade opening gap if conditions met
+    _write_gap_csv(slug, bars)
+    process_gap(symbol, bars)
 
     # 3. Features
     feats = make_features(bars)
@@ -322,6 +345,12 @@ def run_once() -> None:
     if _after_orb:
         for t in TARGETS:
             close_orb_positions(t["symbol"])
+
+    # Gap EOD sweep — close any open gap positions after the entry window
+    _after_gap = GAP_ENABLED and (_now_brt.hour, _now_brt.minute) >= GAP_ENTRY_END
+    if _after_gap:
+        for t in TARGETS:
+            close_gap_positions(t["symbol"])
 
     for t in TARGETS:
         try:

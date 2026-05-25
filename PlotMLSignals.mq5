@@ -23,12 +23,21 @@ input color  ORBLowColor        = clrOrangeRed;     // ORB low breakdown line co
 input color  ORBMidColor        = clrDimGray;       // midpoint line colour
 input int    ORBLineWidth       = 2;                // line thickness
 
+// ── Opening Gap Fill display ──────────────────────────────────────────────
+// Python writes win_gap.csv each cycle with prev_close and today_open.
+input bool   ShowGap            = true;             // draw PrevClose and TodayOpen lines
+input string GapFile            = "win_gap.csv";    // must match gap_path(slug) in config.py
+input color  GapPrevCloseColor  = clrGold;          // previous close (gap fill target) line colour
+input color  GapOpenColor       = clrMagenta;       // today's open (gap origin) line colour
+input int    GapLineWidth       = 2;                // line thickness
+
 //---
 int OnInit()
   {
    EventSetTimer(RefreshSeconds);
    PlotSignals(); // first attempt immediately
    PlotORB();
+   PlotGap();
    return INIT_SUCCEEDED;
   }
 
@@ -36,6 +45,7 @@ void OnTimer()
   {
    PlotSignals();
    PlotORB();
+   PlotGap();
   }
 
 int OnCalculate(const int rates_total, const int prev_calculated,
@@ -47,6 +57,7 @@ int OnCalculate(const int rates_total, const int prev_calculated,
      {
       PlotSignals();
       PlotORB();
+      PlotGap();
      }
    return rates_total;
   }
@@ -59,6 +70,7 @@ void OnDeinit(const int reason)
    ObjectsDeleteAll(0, "SL_");
    ObjectsDeleteAll(0, "SLLine_");
    ObjectsDeleteAll(0, "ORB_");
+   ObjectsDeleteAll(0, "GAP_");
   }
 
 //---
@@ -383,4 +395,69 @@ void PlotSignals()
       s_lastBuy   = buyCount;
       s_lastSell  = sellCount;
      }
+  }
+
+//---
+// ══ Opening Gap Fill ══════════════════════════════════════════════════════════
+void PlotGap()
+  {
+   if(!ShowGap) return;
+
+   int fh = FileOpen(GapFile, FILE_READ|FILE_TXT|FILE_ANSI);
+   if(fh == INVALID_HANDLE)
+     {
+      // File not written yet (Python hasn't run or no gap today).
+      // Keep whatever lines were last drawn.
+      return;
+     }
+
+   // Skip header line
+   if(!FileIsEnding(fh)) FileReadString(fh);
+   if(FileIsEnding(fh))  { FileClose(fh); return; }
+
+   string line = FileReadString(fh);
+   FileClose(fh);
+   if(line == "") return;
+
+   string parts[];
+   if(StringSplit(line, ',', parts) < 3) return;
+
+   double prev_close  = StringToDouble(parts[0]);
+   double today_open  = StringToDouble(parts[1]);
+   double gap_size    = StringToDouble(parts[2]);
+   int    gap_dir     = (ArraySize(parts) >= 4) ? (int)StringToInteger(parts[3]) : 0;
+
+   if(prev_close <= 0 || today_open <= 0 || gap_size <= 0) return;
+
+   // Data is valid — redraw
+   ObjectsDeleteAll(0, "GAP_");
+
+   // ── Previous Close (gap fill target) ─────────────────────────────────────
+   string label_pc = StringFormat("GAP_PrevClose  %.0f  (gap %s %.0f pts)",
+                                  prev_close,
+                                  gap_dir > 0 ? "▲" : "▼",
+                                  gap_size);
+   if(ObjectCreate(0, "GAP_PrevClose", OBJ_HLINE, 0, 0, prev_close))
+     {
+      ObjectSetInteger(0, "GAP_PrevClose", OBJPROP_COLOR,     GapPrevCloseColor);
+      ObjectSetInteger(0, "GAP_PrevClose", OBJPROP_STYLE,     STYLE_SOLID);
+      ObjectSetInteger(0, "GAP_PrevClose", OBJPROP_WIDTH,     GapLineWidth);
+      ObjectSetString( 0, "GAP_PrevClose", OBJPROP_TEXT,      label_pc);
+      ObjectSetInteger(0, "GAP_PrevClose", OBJPROP_BACK,      true);
+      ObjectSetInteger(0, "GAP_PrevClose", OBJPROP_SELECTABLE,false);
+     }
+
+   // ── Today's Open (gap origin) ─────────────────────────────────────────────
+   if(ObjectCreate(0, "GAP_Open", OBJ_HLINE, 0, 0, today_open))
+     {
+      ObjectSetInteger(0, "GAP_Open", OBJPROP_COLOR,     GapOpenColor);
+      ObjectSetInteger(0, "GAP_Open", OBJPROP_STYLE,     STYLE_DOT);
+      ObjectSetInteger(0, "GAP_Open", OBJPROP_WIDTH,     1);
+      ObjectSetString( 0, "GAP_Open", OBJPROP_TEXT,
+                       "GAP Open  " + DoubleToString(today_open, 0));
+      ObjectSetInteger(0, "GAP_Open", OBJPROP_BACK,      true);
+      ObjectSetInteger(0, "GAP_Open", OBJPROP_SELECTABLE,false);
+     }
+
+   ChartRedraw(0);
   }

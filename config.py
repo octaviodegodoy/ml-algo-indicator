@@ -105,6 +105,22 @@ ORB_RISK_PCT      = 1.5         # % of account balance risked per ORB trade (sep
 ORB_MAGIC         = 20260522    # unique magic number — never share with MAGIC_NUMBER
 ORB_TRADE_SHORT   = True        # True = also trade ORB downside breaks (SELL short)
 
+# ── Gap Fill strategy ─────────────────────────────────────────────────────────
+# Fades the overnight gap expecting price to return to the previous session's
+# close within the first ~25 minutes.
+#   Gap Up  (open > prev_close): SELL, TP = prev_close, SL = open + GAP_SL_MULT × gap
+#   Gap Down (open < prev_close): BUY,  TP = prev_close, SL = open - GAP_SL_MULT × gap
+GAP_ENABLED       = True
+GAP_MIN_PTS       = 150         # minimum gap in points to trade (filters small noise gaps)
+GAP_MAX_PTS       = 1500        # maximum gap — very large gaps may reflect strong trends that won't fill
+GAP_SL_MULT       = 1.0         # SL distance = 1× gap beyond the entry price
+GAP_TP_MULT       = 1.0         # TP = prev_close (full gap fill); R:R depends on entry price
+GAP_RISK_PCT      = 1.0         # % of account balance risked per gap trade (conservative)
+GAP_MAGIC         = 20260525    # unique magic number
+GAP_TRADE_SHORT   = True        # True = also trade gap-up (SELL side)
+GAP_ENTRY_START   = (9, 5)      # BRT: earliest entry — after first M5 bar closes (post-auction)
+GAP_ENTRY_END     = (9, 30)     # BRT: stop entering new gap trades after 09:30
+
 # ── Output paths ──────────────────────────────────────────────────────────────
 _files_dir = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'Files')
@@ -116,5 +132,6 @@ def out_path(slug: str)   -> str: return os.path.join(_files_dir, f'{slug}_ml_si
 def dom_path(slug: str)   -> str: return os.path.join(_files_dir, f'{slug}_dom_snapshots.csv')
 def ticks_path(slug: str) -> str: return os.path.join(_files_dir, f'{slug}_tick_agg.csv')
 def orb_path(slug: str)   -> str: return os.path.join(_files_dir, f'{slug}_orb.csv')
+def gap_path(slug: str)   -> str: return os.path.join(_files_dir, f'{slug}_gap.csv')
 
 

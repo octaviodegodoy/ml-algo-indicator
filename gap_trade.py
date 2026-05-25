@@ -1,37 +1,43 @@
 """
-orb_trade.py — Opening Range Breakout (ORB) strategy.
+gap_trade.py — Opening Gap Fill strategy.
 
-Builds the opening range from the first ORB_BARS M5 bars each session
-(default = first 3 bars = 09:00–09:14 BRT) and executes a market order
-on the first confirmed breakout bar, with a fixed SL and TP based on the
-ORB range.  At most one trade per direction per calendar day.
+WIN futures (mini Ibovespa) regularly open with a price gap vs the previous
+session's close.  This module fades that gap (counter-trend, mean-reversion)
+expecting price to return to the previous close within the first 30 minutes.
+
+Logic:
+  - Gap Up  (today_open > prev_close): SELL at market, TP = prev_close, SL above open
+  - Gap Down (today_open < prev_close): BUY  at market, TP = prev_close, SL below open
+
+Filters:
+  - Gap size must be in [GAP_MIN_PTS, GAP_MAX_PTS] (noise filter + trend filter)
+  - Entry only inside GAP_ENTRY_START .. GAP_ENTRY_END window (first ~25 min)
+  - Current close must still be on the gap side (gap not yet fully filled)
+  - At most one trade per direction per calendar day
 
 Architecture:
-  - Uses ORB_MAGIC (separate from MAGIC_NUMBER) so positions are never
-    confused with ML-driven trades.
-  - TP is placed directly on the order; the broker handles the exit.
-  - Daily state auto-resets on each new BRT calendar date.
-  - Call process_orb(symbol, bars) each cycle from the main loop.
-  - Call close_orb_positions(symbol) for EOD cleanup when outside session.
+  - Uses GAP_MAGIC (separate from ORB_MAGIC and MAGIC_NUMBER)
+  - Daily state resets automatically on each new BRT calendar date
+  - Call process_gap(symbol, bars) each cycle from the main loop
+  - Call close_gap_positions(symbol) for EOD cleanup when outside session
 """
 
 import MetaTrader5 as mt5
-import numpy as np
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple
 
 from config import (
     TRADE_ENABLED,
-    ORB_ENABLED, ORB_BARS, ORB_SESSION_START, ORB_SESSION_END,
-    ORB_SL_MULT, ORB_TP_MULT, ORB_RISK_PCT, ORB_MAGIC, ORB_TRADE_SHORT,
+    GAP_ENABLED, GAP_MIN_PTS, GAP_MAX_PTS,
+    GAP_SL_MULT, GAP_TP_MULT, GAP_RISK_PCT, GAP_MAGIC,
+    GAP_ENTRY_START, GAP_ENTRY_END, GAP_TRADE_SHORT,
     MAX_SLIPPAGE,
 )
 
 _BRT = timezone(timedelta(hours=-3))
 
 # ── Per-day state ─────────────────────────────────────────────────────────────
-# Resets automatically when the BRT calendar date changes.
 _state: dict = {}   # symbol → {'date': date, 'buy_done': bool, 'sell_done': bool}
 
 
@@ -43,36 +49,42 @@ def _get_state(symbol: str) -> dict:
     return _state[symbol]
 
 
-def _in_orb_session() -> bool:
+def _in_entry_window() -> bool:
     now = datetime.now(_BRT)
     hm  = (now.hour, now.minute)
-    return ORB_SESSION_START <= hm < ORB_SESSION_END
+    return GAP_ENTRY_START <= hm < GAP_ENTRY_END
 
 
-def compute_orb(bars: pd.DataFrame) -> Optional[Tuple[float, float, float]]:
+def compute_gap(bars: pd.DataFrame) -> Optional[Tuple[float, float, float, int]]:
     """
-    Return (orb_high, orb_low, orb_range) from today's first ORB_BARS M5 bars.
-    Returns None if fewer than ORB_BARS bars have formed today.
+    Return (gap_size, today_open, prev_close, gap_dir) or None.
+      gap_dir: +1 = gap up (open above prev close), -1 = gap down.
 
-    Uses the raw bar-index date (broker clock = BRT) consistent with the rest of
-    the codebase (pd.Timestamp.now().normalize() == broker date for BRT sessions).
+    Strips the UTC timezone label from the bars index because the broker
+    stores BRT timestamps tagged as UTC (same convention as the ORB module).
     """
+    naive      = bars.index.tz_localize(None)
     today      = pd.Timestamp.now().normalize()
-    today_bars = bars[bars.index.tz_localize(None).normalize() == today]
-    if len(today_bars) < ORB_BARS:
+    today_bars = bars[naive.normalize() == today]
+    prev_bars  = bars[naive.normalize() < today]
+
+    if today_bars.empty or prev_bars.empty:
         return None
-    window    = today_bars.iloc[:ORB_BARS]
-    orb_high  = float(window['High'].max())
-    orb_low   = float(window['Low'].min())
-    orb_range = orb_high - orb_low
-    if orb_range <= 0:
+
+    today_open = float(today_bars['Open'].iloc[0])
+    prev_close = float(prev_bars['Close'].iloc[-1])
+    gap_size   = abs(today_open - prev_close)
+    gap_dir    = 1 if today_open > prev_close else -1
+
+    if gap_size <= 0:
         return None
-    return orb_high, orb_low, orb_range
+
+    return gap_size, today_open, prev_close, gap_dir
 
 
 # ── Lot sizing ────────────────────────────────────────────────────────────────
 def _lot_size(symbol: str, sl_pts: float) -> float:
-    """Risk ORB_RISK_PCT% of account balance.  Falls back to minimum lot on errors."""
+    """Risk GAP_RISK_PCT% of account balance.  Falls back to minimum lot on errors."""
     info    = mt5.symbol_info(symbol)
     account = mt5.account_info()
     if info is None or account is None or sl_pts <= 0:
@@ -80,7 +92,7 @@ def _lot_size(symbol: str, sl_pts: float) -> float:
     tick_size           = info.trade_tick_size  if info.trade_tick_size  > 0 else 1.0
     tick_value          = info.trade_tick_value if info.trade_tick_value > 0 else 0.20
     point_value_per_lot = tick_value / tick_size
-    risk_amount         = account.balance * ORB_RISK_PCT / 100.0
+    risk_amount         = account.balance * GAP_RISK_PCT / 100.0
     raw_lot             = risk_amount / (sl_pts * point_value_per_lot)
     step                = info.volume_step if info.volume_step > 0 else 0.01
     lot                 = round(raw_lot / step) * step
@@ -123,7 +135,7 @@ def _adjust_stops(
 
 
 # ── Order execution ───────────────────────────────────────────────────────────
-def _send_orb_order(
+def _send_gap_order(
     symbol: str,
     order_type: int,
     lot: float,
@@ -146,37 +158,38 @@ def _send_orb_order(
         'sl':           sl,
         'tp':           tp,
         'deviation':    MAX_SLIPPAGE,
-        'magic':        ORB_MAGIC,
-        'comment':      f'orb_{side.lower()}',
+        'magic':        GAP_MAGIC,
+        'comment':      f'gap_{side.lower()}',
         'type_time':    mt5.ORDER_TIME_GTC,
         'type_filling': mt5.ORDER_FILLING_IOC,
     })
     if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
         err = result.retcode if result else mt5.last_error()
-        print(f"  [ORB] {side} failed: retcode={err}  price={price:.{digits}f}  SL={sl:.{digits}f}  TP={tp:.{digits}f}")
+        print(f"  [GAP] {side} failed: retcode={err}  price={price:.{digits}f}  SL={sl:.{digits}f}  TP={tp:.{digits}f}")
         return False
 
     sl_dist = abs(price - sl)
     tp_dist = abs(tp - price)
+    rr      = tp_dist / sl_dist if sl_dist > 0 else 0
     print(
-        f"  [ORB] {side} {lot} lots {symbol} @ {price:.{digits}f}"
+        f"  [GAP] {side} {lot} lots {symbol} @ {price:.{digits}f}"
         f"  SL={sl:.{digits}f} ({sl_dist:.0f}p)"
         f"  TP={tp:.{digits}f} ({tp_dist:.0f}p)"
-        f"  R:R={tp_dist/sl_dist:.1f}"
+        f"  R:R={rr:.1f}"
     )
     return True
 
 
 # ── EOD position close ────────────────────────────────────────────────────────
-def close_orb_positions(symbol: str) -> None:
+def close_gap_positions(symbol: str) -> None:
     """
-    Close all open ORB positions for `symbol`.
-    Called after ORB_SESSION_END to avoid holding overnight.
-    Safe to call repeatedly — does nothing if no ORB positions are open.
+    Close all open GAP positions for `symbol`.
+    Called after GAP_ENTRY_END to avoid holding an unfilled gap overnight.
+    Safe to call repeatedly — does nothing if no GAP positions are open.
     """
     positions = mt5.positions_get(symbol=symbol) or []
     for pos in positions:
-        if pos.magic != ORB_MAGIC:
+        if pos.magic != GAP_MAGIC:
             continue
         tick = mt5.symbol_info_tick(symbol)
         info = mt5.symbol_info(symbol)
@@ -192,82 +205,90 @@ def close_orb_positions(symbol: str) -> None:
             'position':     pos.ticket,
             'price':        price,
             'deviation':    MAX_SLIPPAGE,
-            'magic':        ORB_MAGIC,
-            'comment':      'orb_eod',
+            'magic':        GAP_MAGIC,
+            'comment':      'gap_eod',
             'type_time':    mt5.ORDER_TIME_GTC,
             'type_filling': mt5.ORDER_FILLING_IOC,
         })
         digits = info.digits if info else 2
         if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
             err = result.retcode if result else mt5.last_error()
-            print(f"  [ORB] EOD close failed for #{pos.ticket}: retcode={err}")
+            print(f"  [GAP] EOD close failed for #{pos.ticket}: retcode={err}")
         else:
-            print(f"  [ORB] EOD closed #{pos.ticket} {pos.volume} lots @ {price:.{digits}f}")
+            print(f"  [GAP] EOD closed #{pos.ticket} {pos.volume} lots @ {price:.{digits}f}")
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
-def process_orb(symbol: str, bars: pd.DataFrame) -> None:
+def process_gap(symbol: str, bars: pd.DataFrame) -> None:
     """
     Called each cycle with the latest M5 bars.
-    Detects the first breakout bar above/below the ORB range and fires
-    at most one trade per direction per day.
+    Detects an opening gap and fades it at market if conditions are met.
+    At most one trade per direction per day.
 
     Gates:
-      - ORB_ENABLED and TRADE_ENABLED must be True
-      - Must be inside ORB_SESSION_START .. ORB_SESSION_END (BRT)
-      - ORB must be fully formed (≥ ORB_BARS bars today)
-      - Current bar's close must break outside the ORB range
+      - GAP_ENABLED and TRADE_ENABLED must be True
+      - Must be inside GAP_ENTRY_START .. GAP_ENTRY_END window (BRT)
+      - Gap must be in [GAP_MIN_PTS, GAP_MAX_PTS]
+      - Current close must still show the gap (not already filled)
       - Not already traded that direction today
     """
-    if not ORB_ENABLED or not TRADE_ENABLED:
+    if not GAP_ENABLED or not TRADE_ENABLED:
         return
 
     state = _get_state(symbol)
-    if state['buy_done'] and (state['sell_done'] or not ORB_TRADE_SHORT):
-        return   # all available directions already traded today
-
-    if not _in_orb_session():
+    if state['buy_done'] and (state['sell_done'] or not GAP_TRADE_SHORT):
         return
 
-    orb = compute_orb(bars)
-    if orb is None:
-        return   # opening range not yet formed
+    if not _in_entry_window():
+        return
 
-    orb_high, orb_low, orb_range = orb
-    current_close = float(bars['Close'].iloc[-1])
+    result = compute_gap(bars)
+    if result is None:
+        return
+
+    gap_size, today_open, prev_close, gap_dir = result
+
+    if not (GAP_MIN_PTS <= gap_size <= GAP_MAX_PTS):
+        return  # too small (noise) or too large (strong overnight trend, may not fill)
 
     info = mt5.symbol_info(symbol)
     tick = mt5.symbol_info_tick(symbol)
     if info is None or tick is None:
         return
 
-    sl_pts = orb_range * ORB_SL_MULT
-    tp_pts = orb_range * ORB_TP_MULT
+    current_close = float(bars['Close'].iloc[-1])
+    sl_pts = gap_size * GAP_SL_MULT
 
     print(
-        f"  [ORB] {symbol}  close={current_close:.0f}"
-        f"  range=[{orb_low:.0f}–{orb_high:.0f}] ({orb_range:.0f}p)"
-        f"  SL={sl_pts:.0f}p  TP={tp_pts:.0f}p"
+        f"  [GAP] {symbol}  gap={gap_size:.0f}p  dir={'UP' if gap_dir == 1 else 'DOWN'}"
+        f"  open={today_open:.0f}  prev_close={prev_close:.0f}"
+        f"  close={current_close:.0f}"
         f"  buy={'done' if state['buy_done'] else 'open'}"
         f"  sell={'done' if state['sell_done'] else 'open'}"
     )
 
-    # ── BUY: close > ORB High ─────────────────────────────────────────────────
-    if not state['buy_done'] and current_close > orb_high:
-        price = tick.ask
-        sl    = price - sl_pts
-        tp    = price + tp_pts
-        lot   = _lot_size(symbol, sl_pts)
-        print(f"  [ORB] BUY breakout  close={current_close:.0f} > orb_high={orb_high:.0f}")
-        if _send_orb_order(symbol, mt5.ORDER_TYPE_BUY, lot, price, sl, tp, info):
-            state['buy_done'] = True
+    # ── Gap Up → fade with SELL ───────────────────────────────────────────────
+    # Price opened above prev_close; enter short expecting it to return to prev_close.
+    # Only enter if current close is still above prev_close (gap not yet filled).
+    if gap_dir == 1 and GAP_TRADE_SHORT and not state['sell_done']:
+        if current_close > prev_close + GAP_MIN_PTS:
+            price = tick.bid
+            sl    = price + sl_pts      # SL above entry (we lose if price continues up)
+            tp    = prev_close          # TP at gap fill level
+            lot   = _lot_size(symbol, sl_pts)
+            print(f"  [GAP] SELL gap-up fade  close={current_close:.0f} > prev_close={prev_close:.0f}")
+            if _send_gap_order(symbol, mt5.ORDER_TYPE_SELL, lot, price, sl, tp, info):
+                state['sell_done'] = True
 
-    # ── SELL: close < ORB Low ─────────────────────────────────────────────────
-    if ORB_TRADE_SHORT and not state['sell_done'] and current_close < orb_low:
-        price = tick.bid
-        sl    = price + sl_pts
-        tp    = price - tp_pts
-        lot   = _lot_size(symbol, sl_pts)
-        print(f"  [ORB] SELL breakout  close={current_close:.0f} < orb_low={orb_low:.0f}")
-        if _send_orb_order(symbol, mt5.ORDER_TYPE_SELL, lot, price, sl, tp, info):
-            state['sell_done'] = True
+    # ── Gap Down → fade with BUY ──────────────────────────────────────────────
+    # Price opened below prev_close; enter long expecting it to return to prev_close.
+    # Only enter if current close is still below prev_close (gap not yet filled).
+    if gap_dir == -1 and not state['buy_done']:
+        if current_close < prev_close - GAP_MIN_PTS:
+            price = tick.ask
+            sl    = price - sl_pts      # SL below entry (we lose if price continues down)
+            tp    = prev_close          # TP at gap fill level
+            lot   = _lot_size(symbol, sl_pts)
+            print(f"  [GAP] BUY  gap-down fade  close={current_close:.0f} < prev_close={prev_close:.0f}")
+            if _send_gap_order(symbol, mt5.ORDER_TYPE_BUY, lot, price, sl, tp, info):
+                state['buy_done'] = True
