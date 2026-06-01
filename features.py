@@ -30,6 +30,87 @@ def _rsi(close: pd.Series, n: int = 14, min_periods: int = 1) -> pd.Series:
     return 100 - 100 / (1 + rs)
 
 
+# ── Renko conversion ─────────────────────────────────────────────────────────
+def resolve_renko_box_size(
+    df: pd.DataFrame,
+    mode: str = 'atr',
+    box_points: float = 120.0,
+    atr_mult: float = 1.0,
+    atr_period: int = 14,
+    min_box_points: float = 20.0,
+) -> float:
+    """Resolve Renko box size in price points (fixed or ATR-based)."""
+    box = float(box_points)
+    if mode.lower() == 'atr':
+        atr = _atr(df, atr_period)
+        atr_med = float(np.nanmedian(atr.values))
+        if np.isfinite(atr_med) and atr_med > 0:
+            box = atr_med * float(atr_mult)
+    if not np.isfinite(box) or box <= 0:
+        box = float(box_points)
+    return max(float(min_box_points), float(box))
+
+
+def make_renko_bars(
+    df: pd.DataFrame,
+    box_points: float,
+) -> pd.DataFrame:
+    """Convert time bars to Renko OHLCV bars using close-based brick generation.
+
+    Multiple bricks formed in the same source bar receive +1 second offsets so
+    downstream CSV timestamps remain unique at second resolution.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=['Open', 'High', 'Low', 'Close', 'Volume'])
+
+    need = {'Open', 'High', 'Low', 'Close'}
+    if not need.issubset(df.columns):
+        raise ValueError("make_renko_bars requires Open/High/Low/Close columns")
+
+    box = float(box_points)
+    if not np.isfinite(box) or box <= 0:
+        raise ValueError("box_points must be > 0")
+
+    out_rows = []
+    anchor = float(df['Close'].iloc[0])
+    # Align to nearest box grid so first brick is deterministic.
+    anchor = np.floor(anchor / box) * box
+
+    for ts, row in df.iterrows():
+        price = float(row['Close'])
+        if not np.isfinite(price):
+            continue
+
+        move = price - anchor
+        n_up = int(np.floor(move / box)) if move > 0 else 0
+        n_dn = int(np.floor((-move) / box)) if move < 0 else 0
+        n_bricks = n_up + n_dn
+        if n_bricks <= 0:
+            continue
+
+        direction = 1.0 if move > 0 else -1.0
+        bar_vol = float(row['Volume']) if 'Volume' in row.index else 0.0
+        vol_per_brick = bar_vol / n_bricks if n_bricks > 0 else bar_vol
+
+        for k in range(n_bricks):
+            o = anchor
+            c = anchor + direction * box
+            h = max(o, c)
+            l = min(o, c)
+            brick_ts = ts + pd.Timedelta(seconds=k)
+            out_rows.append((brick_ts, o, h, l, c, vol_per_brick))
+            anchor = c
+
+    if not out_rows:
+        return df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+
+    renko = pd.DataFrame(
+        out_rows,
+        columns=['time', 'Open', 'High', 'Low', 'Close', 'Volume'],
+    ).set_index('time').sort_index()
+    return renko
+
+
 # ── Core OHLCV technicals ─────────────────────────────────────────────────────
 def make_features(df: pd.DataFrame, prefix: str = '') -> pd.DataFrame:
     out = pd.DataFrame(index=df.index)

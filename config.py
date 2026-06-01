@@ -34,6 +34,41 @@ INTERVAL_SECONDS  = 60
 N_SPLITS_CV       = 5
 RECENCY_DECAY     = 1.2          # lowered from 2.0 — reduces oversensitivity to single volatile bars
 
+# ── Renko preprocessing for ML ───────────────────────────────────────────────
+# Converts the M5 price series to Renko boxes before feature/label generation.
+USE_RENKO_BARS     = True
+RENKO_BOX_MODE     = 'atr'        # 'atr' or 'points'
+RENKO_BOX_POINTS   = 35.0        # used when mode='points' and as fallback
+RENKO_BOX_ATR_MULT = 1.0          # box = median(ATR14) * this multiplier when mode='atr'
+RENKO_ATR_PERIOD   = 14
+RENKO_MIN_POINTS   = 20.0         # floor for very quiet sessions
+
+# ── Optional RNN sequence model (trained on Renko + indicators) ─────────────
+USE_RNN_MODEL       = True
+RNN_SEQ_LEN         = 32
+RNN_HIDDEN_SIZE     = 32
+RNN_NUM_LAYERS      = 1
+RNN_DROPOUT         = 0.0
+RNN_EPOCHS          = 4
+RNN_LR              = 0.001
+RNN_BATCH_SIZE      = 128
+RNN_BLEND_WEIGHT    = 0.35   # final prob = (1-w)*GB + w*RNN where RNN is available
+
+# ── RL execution overlay (hybrid: supervised signal + RL action policy) ─────
+# The RL policy learns an execution decision from historical probabilities and
+# market movement, then overrides only the latest live execution signal.
+USE_RL_OVERLAY      = True
+RL_TRAIN_WINDOW     = 2500    # recent rows used to fit Q-table each cycle
+RL_N_EPISODES       = 12      # training passes over the window
+RL_ALPHA            = 0.08    # Q-learning step size
+RL_GAMMA            = 0.95    # discount factor
+RL_EPSILON          = 0.05    # exploration during fitting
+RL_COST_BPS         = 1.5     # round-turn equivalent switching cost
+RL_HOLD0_PENALTY_BPS = 0.02   # tiny penalty for staying in signal=0 state
+RL_PROBA_BINS       = 10
+RL_DI_BINS          = 7
+RL_VOL_BINS         = 5
+
 # ── Cooldown after stop-out ───────────────────────────────────────────────────
 COOLDOWN_BARS     = 6            # bars to skip re-entry after a stop-out (halved from 12 → 30 min buffer)
 

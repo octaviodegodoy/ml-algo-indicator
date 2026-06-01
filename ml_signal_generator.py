@@ -35,17 +35,31 @@ from config import (
     REQUIRE_DI_CONFIRMATION, DI_CONFIRM_MIN_DIFF, SELL_PERSISTENCE_BARS,
     ORB_BARS, ORB_ENABLED, ORB_SESSION_END,
     GAP_ENABLED, GAP_ENTRY_END,
+    USE_RENKO_BARS, RENKO_BOX_MODE, RENKO_BOX_POINTS,
+    RENKO_BOX_ATR_MULT, RENKO_ATR_PERIOD, RENKO_MIN_POINTS,
+    USE_RNN_MODEL, RNN_SEQ_LEN, RNN_HIDDEN_SIZE, RNN_NUM_LAYERS,
+    RNN_DROPOUT, RNN_EPOCHS, RNN_LR, RNN_BATCH_SIZE, RNN_BLEND_WEIGHT,
+    USE_RL_OVERLAY, RL_TRAIN_WINDOW, RL_N_EPISODES, RL_ALPHA, RL_GAMMA,
+    RL_EPSILON, RL_COST_BPS, RL_HOLD0_PENALTY_BPS, RL_PROBA_BINS,
+    RL_DI_BINS, RL_VOL_BINS, TRADE_BOTH_SIDES,
 )
 from mt5_client import mt5_setup, fetch_bars, fetch_htf_bars
 from microstructure import append_dom_snapshot, fetch_and_aggregate_ticks
 from features import (
     _atr, make_features, add_time_features,
     load_dom_features, load_tick_features, make_htf_features, merge_microstructure,
+    make_renko_bars, resolve_renko_box_size,
 )
 from model import (
     triple_barrier_labels, compute_recency_weights,
     evaluate_walkforward, compute_sl_points, _make_classifier,
 )
+from rnn_model import (
+    fit_rnn_sequence_classifier,
+    predict_rnn_proba,
+    is_rnn_available,
+)
+from rl_overlay import RLOverlayConfig, choose_latest_execution_signal
 from trade import execute_trade, manage_trailing_stops, manage_grid_orders, init_signal_state
 from orb_trade import process_orb, close_orb_positions
 from gap_trade import process_gap, close_gap_positions, compute_gap
@@ -136,6 +150,23 @@ def process_target(target: dict) -> None:
         print(f"[{symbol}] no bars")
         return
 
+    bars_model = bars
+    if USE_RENKO_BARS:
+        box = resolve_renko_box_size(
+            bars,
+            mode=RENKO_BOX_MODE,
+            box_points=RENKO_BOX_POINTS,
+            atr_mult=RENKO_BOX_ATR_MULT,
+            atr_period=RENKO_ATR_PERIOD,
+            min_box_points=RENKO_MIN_POINTS,
+        )
+        bars_model = make_renko_bars(bars, box)
+        if len(bars_model) < 500:
+            print(f"[{symbol}] renko rows too low ({len(bars_model)}), using time bars")
+            bars_model = bars
+        else:
+            print(f"[{symbol}] renko enabled: box={box:.1f}  rows={len(bars_model)}")
+
     # 2b. ORB — write high/low for today's opening range (consumed by the indicator)
     _write_orb_csv(slug, bars)
 
@@ -147,17 +178,17 @@ def process_target(target: dict) -> None:
     process_gap(symbol, bars)
 
     # 3. Features
-    feats = make_features(bars)
+    feats = make_features(bars_model)
     feats = add_time_features(feats)
     feats, _  = merge_microstructure(feats, load_dom_features(slug),  prefix="dom")
     feats, _  = merge_microstructure(feats, load_tick_features(slug), prefix="tick")
-    htf_feats = make_htf_features(fetch_htf_bars(symbol), bars)
+    htf_feats = make_htf_features(fetch_htf_bars(symbol), bars_model)
     if not htf_feats.empty:
         feats = pd.concat([feats, htf_feats], axis=1)
 
     # 4. Labels
-    atr14    = _atr(bars, 14)
-    target_y = triple_barrier_labels(bars, atr14, TB_MAX_BARS, TB_PT_MULT, TB_SL_MULT)
+    atr14    = _atr(bars_model, 14)
+    target_y = triple_barrier_labels(bars_model, atr14, TB_MAX_BARS, TB_PT_MULT, TB_SL_MULT)
 
     # 5. Align features and labels
     aligned = pd.concat([feats, target_y], axis=1).dropna(subset=["y"])
@@ -190,10 +221,37 @@ def process_target(target: dict) -> None:
     model.fit(X, y, gb__sample_weight=rec_weights)
 
     proba  = model.predict_proba(X)[:, 1]
+
+    rnn_bundle = None
+    if USE_RNN_MODEL:
+        if not is_rnn_available():
+            print(f"[{symbol}] RNN requested but torch is not installed; skipping RNN blend")
+        else:
+            rnn_bundle = fit_rnn_sequence_classifier(
+                X, y,
+                seq_len=RNN_SEQ_LEN,
+                hidden_size=RNN_HIDDEN_SIZE,
+                num_layers=RNN_NUM_LAYERS,
+                dropout=RNN_DROPOUT,
+                epochs=RNN_EPOCHS,
+                lr=RNN_LR,
+                batch_size=RNN_BATCH_SIZE,
+            )
+            if rnn_bundle is None:
+                print(f"[{symbol}] RNN skipped (insufficient sequence rows or training unavailable)")
+            else:
+                rnn_proba = predict_rnn_proba(rnn_bundle, X)
+                valid = np.isfinite(rnn_proba)
+                if valid.any():
+                    w = min(max(float(RNN_BLEND_WEIGHT), 0.0), 1.0)
+                    proba = proba.copy()
+                    proba[valid] = (1.0 - w) * proba[valid] + w * rnn_proba[valid]
+                    print(f"[{symbol}] RNN blended into probabilities (w={w:.2f}, rows={int(valid.sum())})")
+
     signal = (proba > PROB_THRESHOLD).astype(int)
 
     sig_series = pd.Series(signal, index=X.index)
-    sl_pts     = compute_sl_points(sig_series, bars, atr14, TB_SL_MULT, TB_MAX_BARS)
+    sl_pts     = compute_sl_points(sig_series, bars_model, atr14, TB_SL_MULT, TB_MAX_BARS)
 
     # Use current-bar ATR for SL sizing (avoids stale historical median on volatile days)
     _atr_last  = float(atr14.iloc[-1]) if not np.isnan(float(atr14.iloc[-1])) else float(np.nanmedian(atr14.values))
@@ -218,6 +276,13 @@ def process_target(target: dict) -> None:
     if len(tail_feats) > 0:
         tail_feats  = tail_feats.reindex(columns=X.columns, fill_value=np.nan)
         tail_proba  = model.predict_proba(tail_feats)[:, 1]
+        if rnn_bundle is not None:
+            tail_rnn_proba = predict_rnn_proba(rnn_bundle, tail_feats)
+            valid_tail = np.isfinite(tail_rnn_proba)
+            if valid_tail.any():
+                w = min(max(float(RNN_BLEND_WEIGHT), 0.0), 1.0)
+                tail_proba = tail_proba.copy()
+                tail_proba[valid_tail] = (1.0 - w) * tail_proba[valid_tail] + w * tail_rnn_proba[valid_tail]
         tail_signal = (tail_proba > PROB_THRESHOLD).astype(int)
         prev_sig    = int(signal[-1]) if len(signal) > 0 else 0
         tail_sl     = []
@@ -246,6 +311,41 @@ def process_target(target: dict) -> None:
         latest_signal = int(new_df.sort_values("Timestamp").iloc[-1]["ML_Signal"])
     else:
         latest_signal = 0
+
+    # Optional RL execution overlay: overrides only the live execution signal.
+    # CSV keeps the supervised signal for transparency/indicator plotting.
+    latest_exec_signal = latest_signal
+    if USE_RL_OVERLAY and len(X) >= 120:
+        close_aligned = bars_model['Close'].reindex(X.index)
+        close_aligned = close_aligned.ffill().bfill()
+        di_vals = feats['di_diff_14'].reindex(X.index) if 'di_diff_14' in feats.columns else pd.Series(0.0, index=X.index)
+        atr_vals = feats['atr_ratio'].reindex(X.index) if 'atr_ratio' in feats.columns else pd.Series(1.0, index=X.index)
+
+        rl_cfg = RLOverlayConfig(
+            train_window=RL_TRAIN_WINDOW,
+            n_episodes=RL_N_EPISODES,
+            alpha=RL_ALPHA,
+            gamma=RL_GAMMA,
+            epsilon=RL_EPSILON,
+            cost_bps=RL_COST_BPS,
+            hold0_penalty_bps=RL_HOLD0_PENALTY_BPS,
+            proba_bins=RL_PROBA_BINS,
+            di_bins=RL_DI_BINS,
+            vol_bins=RL_VOL_BINS,
+        )
+
+        latest_exec_signal, rl_info = choose_latest_execution_signal(
+            proba=np.asarray(proba, dtype=float),
+            close=np.asarray(close_aligned.values, dtype=float),
+            di_diff=np.asarray(di_vals.values, dtype=float),
+            atr_ratio=np.asarray(atr_vals.values, dtype=float),
+            cfg=rl_cfg,
+            trade_both_sides=TRADE_BOTH_SIDES,
+        )
+        print(
+            f"[{symbol}] RL overlay: ml={latest_signal} -> exec={latest_exec_signal} "
+            f"(rows={rl_info.get('rows', 0)}, p={rl_info.get('latest_proba', 0.0):.3f})"
+        )
 
     # 8. Write CSV (with optional history freeze)
     csv_path = out_path(slug)
@@ -284,7 +384,7 @@ def process_target(target: dict) -> None:
         new_df.to_csv(csv_path, index=False)
 
     # 9. Execute trade on latest signal (quality gate + asymmetric persistence + DI gate)
-    signal_label  = "BUY" if latest_signal == 1 else "SELL/FLAT"
+    signal_label  = "BUY" if latest_exec_signal == 1 else "SELL/FLAT"
     trigger       = "TRIGGERED" if latest_proba > PROB_THRESHOLD else "below"
     # Volatility gate: skip entry when current ATR > 2× the 20-bar ATR median (choppy/gapping bar)
     _atr_median  = float(np.nanmedian(atr14.iloc[-20:].values))
@@ -296,9 +396,9 @@ def process_target(target: dict) -> None:
     _di_diff = float(feats['di_diff_14'].iloc[-1]) if 'di_diff_14' in feats.columns and not np.isnan(feats['di_diff_14'].iloc[-1]) else 0.0
     _di_ok   = True
     if REQUIRE_DI_CONFIRMATION:
-        if latest_signal == 0 and _di_diff > -DI_CONFIRM_MIN_DIFF:
+        if latest_exec_signal == 0 and _di_diff > -DI_CONFIRM_MIN_DIFF:
             _di_ok = False   # SELL blocked: DI not confirming downtrend
-        elif latest_signal == 1 and _di_diff < DI_CONFIRM_MIN_DIFF:
+        elif latest_exec_signal == 1 and _di_diff < DI_CONFIRM_MIN_DIFF:
             _di_ok = False   # BUY blocked: DI not confirming uptrend
 
     print(f"[{symbol}] signal={signal_label}  proba={latest_proba:.3f} {'>' if latest_proba > PROB_THRESHOLD else '<'} threshold={PROB_THRESHOLD}  ({trigger})  auc={_auc:.3f} ({'PASS' if _auc >= MIN_AUC else 'FAIL'})  sl={avg_sl_val}p  atr={_atr_current:.0f}  di_diff={_di_diff:.1f} ({'DI-OK' if _di_ok else 'DI-BLOCKED'}){'  [HIGH-VOL GATE]' if _high_vol else ''}")
@@ -309,17 +409,17 @@ def process_target(target: dict) -> None:
         # BUY requires only 2.  Prevents confirming a short at reversal extremes.
         _sell_persist = SELL_PERSISTENCE_BARS
         buf = _signal_buffer.setdefault(symbol, deque(maxlen=max(2, _sell_persist)))
-        buf.append(latest_signal)
-        _required = _sell_persist if latest_signal == 0 else 2
+        buf.append(latest_exec_signal)
+        _required = _sell_persist if latest_exec_signal == 0 else 2
         _cooldown  = _cooldown_counter.get(symbol, 0)
         if _cooldown > 0:
             _cooldown_counter[symbol] = _cooldown - 1
             print(f"[{symbol}] trade HELD — cooldown ({_cooldown - 1} bars remaining)")
         elif len(buf) >= _required and len(set(list(buf)[-_required:])) == 1:
-            execute_trade(symbol, latest_signal, avg_sl_val)
+            execute_trade(symbol, latest_exec_signal, avg_sl_val)
             # Reset cooldown on flat signal (signal=0 means close long / go flat)
             # so the next long entry waits COOLDOWN_BARS bars before re-entering
-            if latest_signal == 0:
+            if latest_exec_signal == 0:
                 _cooldown_counter[symbol] = COOLDOWN_BARS
         else:
             print(f"[{symbol}] trade HELD — persistence waiting ({len(buf)}/{_required} bars, buf={list(buf)[-_required:]})")
